@@ -1,0 +1,1410 @@
+---
+title: "1st Assignment"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+author: areknazkhaligian
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(plyr)
+library(dplyr)     # To compute the `union` of the levels.
+library(png)       # To include images in this document.
+library(knitr)     # To include images inline in this doc.
+library(moments)   # Skewness
+library(e1071)     # Alternative for Skewness
+library(glmnet)    # Lasso
+library(caret)     # To enable Lasso training with CV.
+library(FSelector)
+library(reshape2)  # for ggplot2 correlation matrix
+library(data.table)
+```
+
+
+# Introduction
+
+This document focuses on applying the Feature Engineering processes and the Evaluation methods to solve a practical scenario: Predict the price of houses.
+In particular, we are going to use the experimental scenario proposed by the House Prices Dataset. This dataset includes 79 explanatory variables of residential homes. For more details on the dataset and the competition see <https://www.kaggle.com/c/house-prices-advanced-regression-techniques>.
+
+This dataset is close to the kind of data found in the real world: it is not clean, it might include repeated, correlated or uninformative features, it has null or wrong values, etc 
+Therefore, the first step is to visualize and analyze the dataset in order to understand the information that we have. Then, we have to clean the dataset to solve the problems it might present.
+Once we have the dataset cleaned, we can start the feature engineering process to select the most representative feature set to feed the regression models.
+
+## What is my goal?
+- To predict the final price of each home (this is a regression task).
+- To clean the dataset to allow its further processing.
+- To use feature engineering techniques 
+- To properly apply the evaluation methods and ideas (train, validation, test splitting; cross-validation, chose the proper metric, ..) to understand the real performance of the proposed models, making sure that they will generalize to unseen data (test set).
+
+# Useful Functions
+
+In order to facilitate the evaluation of the impact of the different steps, I am going to place the code for creating a baseline `glm` model in a function.  The only thing that changes from one case to another is the dataset that is used to train the model.
+
+
+```{r message=FALSE, warning=FALSE}
+lm.model <- function(training_dataset, validation_dataset, title) {
+  # Create a training control configuration that applies a 5-fold cross validation
+  train_control_config <- trainControl(method = "repeatedcv", 
+                                       number = 5, 
+                                       repeats = 1,
+                                       returnResamp = "all")
+  
+  # Fit a glm model to the input training data
+  this.model <- train(SalePrice ~ ., 
+                       data = training_dataset, 
+                       method = "glm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+  
+  # Prediction
+  this.model.pred <- predict(this.model, validation_dataset)
+  this.model.pred[is.na(this.model.pred)] <- 0 # To avoid null predictions
+  
+  # RMSE of the model
+  thismodel.rmse <- sqrt(mean((this.model.pred - validation_dataset$SalePrice)^2))
+  
+  # Error in terms of the mean deviation between the predicted value and the price of the houses
+  thismodel.price_error <- mean(abs((exp(this.model.pred) -1) - (exp(validation_dataset$SalePrice) -1)))
+
+  # Plot the predicted values against the actual prices of the houses
+  my_data <- as.data.frame(cbind(predicted=(exp(this.model.pred) -1), observed=(exp(validation_dataset$SalePrice) -1)))
+  ggplot(my_data, aes(predicted, observed)) +
+    geom_point() + geom_smooth(method = "lm") +
+    labs(x="Predicted") +
+    ggtitle(ggtitle(paste(title, 'RMSE: ', format(round(thismodel.rmse, 4), nsmall=4), ' --> Price ERROR:', format(round(thismodel.price_error, 0), nsmall=0), 
+                           sep=''))) +  
+    scale_x_continuous(labels = scales::comma) + 
+    scale_y_continuous(labels = scales::comma)
+}
+```
+
+Function to split a dataset into training and validation.
+
+```{r}
+splitdf <- function(dataframe) {
+  set.seed(123)
+ 	index <- 1:nrow(dataframe)
+ 	trainindex <- sample(index, trunc(length(index)/1.5))
+ 	trainset <- dataframe[trainindex, ]
+ 	testset <- dataframe[-trainindex, ]
+ 	list(trainset=trainset,testset=testset)
+}
+```
+
+
+# Data Reading and preparation
+The dataset is offered in two separated fields, one for the training and another one for the test set. 
+
+```{r Load Data}
+original_training_data = read.csv(file = file.path("train.csv"))
+original_test_data = read.csv(file = file.path("test.csv"))
+```
+
+To avoid applying the Feature Engineering (FE) process two times (once for training and once for test), you can just join both datasets, apply the FE and then split the datasets again. However, `test_data` does not have a column `SalePrice`. Therefore, we first create this column in the test set and then we join the data
+
+```{r Joinning datasets}
+original_test_data$SalePrice <- 0
+dataset <- rbind(original_training_data, original_test_data)
+```
+
+Let's now visualize the dataset to see where to begin
+```{r Dataset Visualization}
+summary(dataset)
+```
+
+We can see some problems just by taking a look to the summary: the dataset has missing values, there are some categorical columns codified as numeric, it has different scales for the feature values, etc
+
+# Data Cleaning
+
+First we remove meaningless features and incomplete cases.
+`Utilities`, `Street`, `Condition2`, and `PoolQC` have 99% of the same values and `Id` is unique for each row.
+```{r NA transformation}
+dataset <- dataset[,-which(names(dataset) == "Utilities")]
+dataset <- dataset[,-which(names(dataset) == "Street")]
+dataset <- dataset[,-which(names(dataset) == "Condition2")]
+dataset <- dataset[,-which(names(dataset) == "PoolQC")]
+dataset <- dataset[,-which(names(dataset) == "Id")]
+```
+
+## Hunting NAs
+
+We need to find a way to remove NAs and will focus on imputing them by finding more appropriate values if possible.
+
+Counting columns with null values.
+
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sort(colSums(sapply(dataset[na.cols], is.na)), decreasing = TRUE)
+```
+
+What we do here, is  go through every single **factor** feature to: extend the number of possible levels to the new default for NAs (`None` or  `No` for categorical features or any other default value described in the documentation). For numerical values, we can just change the NA value for a default value, the median of the other values or some other value that you can infer (i.e., for the null values in the `GarageYrBlt` column you could use the year the house was built as a replacement value).
+
+First, let's take care of all the features where NA values represent "None"
+
+```{r}
+na2none <- function(feature){
+  ### this function adds "None" as a feature factor and replace NAs 
+  feature = factor(feature, levels = c(levels(feature), "None"))
+  feature[is.na(feature)] = "None"
+  return(feature)
+}
+
+# NA values in these features represent "None"
+na2none_features <- c("MiscFeature", "Alley", "Fence", "FireplaceQu", "GarageFinish", "GarageQual", "GarageCond", "GarageType", "BsmtCond", "BsmtExposure", "BsmtQual", "BsmtFinType2", "BsmtFinType1", "Exterior2nd")
+
+# note: exterior2nd was included (and not exterior1st) because this is an "if any" field, so we can assume Na => there isn't an exterior finishing (whereas for exterior1st it is more likely to represent an "Other" category )
+
+# apply the "na2none" function on the relevant features
+dataset[, na2none_features] <- lapply(dataset[, na2none_features], na2none)
+```
+
+Next, we will do the same for the NAs which should be zeros:
+```{r}
+na2zero <- function(feature){
+  ### this function replaces NAs with zero for numerical features
+  feature[is.na(feature)] = 0
+  return(feature)
+}
+
+# NA values in these features represent zero  
+na2zero_features <-c("LotFrontage", "BsmtFullBath", "BsmtHalfBath", "MasVnrArea", "BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF", "GarageCars", "GarageArea")
+
+# apply the "na2zero" function on the relevant features
+dataset[, na2zero_features] <- lapply(dataset[, na2zero_features], na2zero)
+```
+
+The rest of the features which contain NAs require the following imputations:
+```{r}
+# GarageYrBlt: NA => no garage, use the year the house was built in as an approximation
+dataset$GarageYrBlt[is.na(dataset$GarageYrBlt)] <- dataset$YearBuilt[is.na(dataset$GarageYrBlt)] 
+
+# MSZoning: NA => these should be imputed as the most common value
+dataset$MSZoning <- factor(dataset$MSZoning, levels = c(levels(dataset$MSZoning), "Other"))
+dataset$MSZoning[is.na(dataset$MSZoning)] <- names(which.max(summary(dataset$MSZoning)))
+
+# Functional: NA => here the documentation says to assume typcial, so we can replace NA with Typ
+dataset$Functional[is.na(dataset$Functional)] <- "Typ"
+
+# Exterior1st: NA => this should represent an "other" category, since we can assume the house has some sort of exterior covering
+dataset$Exterior1st <- factor(dataset$Exterior1st, levels = c(levels(dataset$Exterior1st), "Other"))
+dataset$Exterior1st[is.na(dataset$Exterior1st)] <- "Other"
+
+# MasVnrType: NA => None is already a valid value, so replace NA with None
+dataset$MasVnrType[is.na(dataset$MasVnrType)] <- "None"
+
+# Electrical: NA => here the existing factor values don't suggest a logical "imputation", create an "Other" category
+dataset$Electrical <- factor(dataset$Electrical, levels = c(levels(dataset$Electrical), "Other"))
+dataset$Electrical[is.na(dataset$Electrical)] <- "Other"
+
+# Kitchen Qual: NA => here, the NA's should be imputed to average
+dataset$KitchenQual[is.na(dataset$KitchenQual)] <- "TA"
+  
+# SaleType: NA => other is already a valid value, so replace NA with "Oth"
+dataset$SaleType[is.na(dataset$SaleType)] <- "Oth"
+```
+
+## Factorize features
+
+If we go back to the summary of the dataset we can identify some numerical features that are actually categories: `MSSubClass` and the Year and Month in which the house was sold. What we have to do is to convert them to the proper 'class'.
+
+```{r}
+# features to be converted to factor
+int2factor_features <- c("GarageYrBlt", "YrSold", "MoSold", "YearRemodAdd", "YearBuilt", "MSSubClass")
+
+# converting features to factor
+dataset[, int2factor_features] <- lapply(dataset[, int2factor_features], as.factor)
+```
+
+```{r}
+# let's make sure all the features are in the correct format
+summary(dataset)
+```
+
+## Outliers
+We will now focus on numerical values. 
+
+In this section we seek to identify outliers to then properly deal with them. The easiest way to detect outliers is visualizing the numerical values; for instance, by `boxploting` the column values.
+
+In this dataset, removing all the outliers identified by the boxplot will be too extreme, so we will plot each varable with potential outliers against the target variable `SalePrice` to visually confirm the outliers.
+
+1, First we will visualize the outliers identified by the default outlier filter:
+```{r}
+# here is the subset of numeric feaures
+numeric_features <- sapply(dataset, class) != "factor"
+
+name_num_features <- names(numeric_features)[numeric_features==TRUE]
+
+num_outlier_collect <- c()
+
+# plot the boxplots for the numeric features & get number of outliers per feature
+for (n in name_num_features){
+  num_outlier <- length(boxplot(dataset[,n], plot = FALSE)$out)
+  num_outlier_collect <- c(num_outlier_collect, num_outlier)
+  boxplot(dataset[,n], xlab = paste(as.character(n), ":  number of outliers =", num_outlier))
+
+  if (length(boxplot(dataset[,n], plot=FALSE)$out)>0){
+    x_axis <- dataset[(dataset[,n] %in% boxplot(dataset[,n], plot=FALSE)$out), "SalePrice"]
+    y_axis <- dataset[,n][(dataset[,n] %in% boxplot(dataset[,n], plot=FALSE)$out)]
+
+  plot(x_axis, y_axis , xlab = "SalePrice", ylab = as.character(n), main = paste(as.character(n), "outliers"))
+  }
+
+  plot(dataset[,"SalePrice"], dataset[,n], xlab = "SalePrice", ylab = as.character(n), main = "all")
+}
+```
+
+Based on these results we can impute the following outliers:
+- BsmtFullBath
+- BsmtFinSF1
+- X2ndFlrSF
+- FullBath
+- HalfBath
+- BedroomAbvGr
+- Fireplaces
+- WoodDeckSF
+- OpenPorchSF
+```{r}
+# features to impute
+impute_features <- c("BsmtFullBath", "BsmtFinSF1", "X2ndFlrSF", "FullBath", "HalfBath", "BedroomAbvGr", "Fireplaces", "WoodDeckSF", "OpenPorchSF")
+
+# imputing the outliers using the median value
+for (i in impute_features){
+  outliers <- boxplot(dataset[,i], plot = FALSE)$out
+  dataset[dataset[,i] %in% outliers, i] <- median(dataset[-which(dataset[,i] %in% outliers), i])
+}
+```
+
+2. Next, we increase the innerquartile range to be less extreme in identifying outliers:
+```{r}
+# remove the numeric columns which are already imputed
+dataset2 <- dataset[,-which(names(dataset) %in% impute_features)]
+
+# here is the subset of numeric feaures remaining
+numeric_features <- sapply(dataset2, class) != "factor"
+
+name_num_features <- names(numeric_features)[numeric_features==TRUE]
+
+num_outlier_collect <- c()
+
+# plot the boxplots for the numeric features & get number of outliers per feature
+for (n in name_num_features){
+  num_outlier <- length(boxplot(dataset2[,n], plot = FALSE, range = 2)$out)
+  num_outlier_collect <- c(num_outlier_collect, num_outlier)
+  boxplot(dataset2[,n], range = 2, xlab = paste(as.character(n), ":  number of outliers =", num_outlier))
+
+  if (length(boxplot(dataset2[,n], plot=FALSE, range = 2)$out)>0){
+    x_axis <- dataset[(dataset2[,n] %in% boxplot(dataset2[,n], plot=FALSE, range = 2)$out), "SalePrice"]
+    y_axis <- dataset2[,n][(dataset2[,n] %in% boxplot(dataset2[,n], plot=FALSE, range = 2)$out)]
+
+  plot(x_axis, y_axis , xlab = "SalePrice", ylab = as.character(n), main = paste(as.character(n), "outliers"))
+  }
+
+  plot(dataset[,"SalePrice"], dataset2[,n], xlab = "SalePrice", ylab = as.character(n), main = "all")
+}
+```
+
+Based on these results we can impute the following outliers:
+- BsmtUnfSF
+- GarageCars
+- GarageArea
+- TotRmsAbvGrd
+```{r}
+# features to impute
+impute_features <- c("BsmtUnfSF", "GarageCars", "GarageArea", "TotRmsAbvGrd")
+
+# imputing the outliers using the median value
+for (i in impute_features){
+  outliers <- boxplot(dataset[,i], plot = FALSE, range = 2)$out
+  dataset[dataset[,i] %in% outliers, i] <- median(dataset[-which(dataset[,i] %in% outliers), i])
+}
+```
+
+3. Increase the innerquartile range again to be less extreme in identifying outliers:
+```{r}
+# remove the numeric columns which are already imputed
+dataset3 <- dataset2[,-which(names(dataset2) %in% impute_features)]
+
+# here is the subset of numeric feaures reamaining 
+numeric_features <- sapply(dataset3, class) != "factor"
+
+name_num_features <- names(numeric_features)[numeric_features==TRUE]
+
+num_outlier_collect <- c()
+
+# plot the boxplots for the numeric features & get number of outliers per feature
+for (n in name_num_features){
+  num_outlier <- length(boxplot(dataset3[,n], plot = FALSE, range = 3)$out)
+  num_outlier_collect <- c(num_outlier_collect, num_outlier)
+  boxplot(dataset3[,n], range = 3, xlab = paste(as.character(n), ":  number of outliers =", num_outlier))
+
+  if (length(boxplot(dataset3[,n], plot=FALSE, range = 3)$out)>0){
+    x_axis <- dataset[(dataset3[,n] %in% boxplot(dataset3[,n], plot=FALSE, range = 3)$out), "SalePrice"]
+    y_axis <- dataset3[,n][(dataset3[,n] %in% boxplot(dataset3[,n], plot=FALSE, range = 3)$out)]
+
+  plot(x_axis, y_axis , xlab = "SalePrice", ylab = as.character(n), main = paste(as.character(n), "outliers"))
+  }
+
+  plot(dataset[,"SalePrice"], dataset3[,n], xlab = "SalePrice", ylab = as.character(n), main = "all")
+}
+```
+
+Based on these results we can impute the following outliers:
+- LotFrontage
+- TotalBsmtSF
+- X1stFlrSF
+```{r}
+# features to impute
+impute_features <- c("LotFrontage", "TotalBsmtSF", "X1stFlrSF")
+
+# impute the outliers using the mdiean
+for (i in impute_features){
+  outliers <- boxplot(dataset[,i], plot = FALSE, range = 3)$out
+  dataset[dataset[,i] %in% outliers, i] <- median(dataset[-which(dataset[,i] %in% outliers), i])
+}
+```
+
+4. Increase the innerquartile range again to be less extreme in identifying outliers:
+```{r}
+# remove the numeric columns which are already imputed
+dataset4 <- dataset3[,-which(names(dataset3) %in% impute_features)]
+
+# here is the subset of numeric feaures
+numeric_features <- sapply(dataset4, class) != "factor"
+
+name_num_features <- names(numeric_features)[numeric_features==TRUE]
+
+num_outlier_collect <- c()
+
+# plot the boxplots for the numeric features & get number of outliers per feature
+for (n in name_num_features){
+  num_outlier <- length(boxplot(dataset4[,n], plot = FALSE, range = 4)$out)
+  num_outlier_collect <- c(num_outlier_collect, num_outlier)
+  boxplot(dataset4[,n], range = 4, xlab = paste(as.character(n), ":  number of outliers =", num_outlier))
+
+  if (length(boxplot(dataset4[,n], plot=FALSE, range = 4)$out)>0){
+    x_axis <- dataset[(dataset4[,n] %in% boxplot(dataset4[,n], plot=FALSE, range = 4)$out), "SalePrice"]
+    y_axis <- dataset4[,n][(dataset4[,n] %in% boxplot(dataset4[,n], plot=FALSE, range = 4)$out)]
+
+  plot(x_axis, y_axis , xlab = "SalePrice", ylab = as.character(n), main = paste(as.character(n), "outliers"))
+  }
+
+  plot(dataset[,"SalePrice"], dataset4[,n], xlab = "SalePrice", ylab = as.character(n), main = "all")
+}
+```
+
+The remaining outliers should be manually imputed:
+```{r}
+# MasVnrArea => use median
+outliers <- boxplot(dataset[,"MasVnrArea"], plot = FALSE, range = 4)$out
+dataset[dataset[,"MasVnrArea"] %in% outliers, "MasVnrArea"] <- median(dataset[-which(dataset[,"MasVnrArea"] %in% outliers), "MasVnrArea"])
+
+# BsmtHalfBath => 2 are outliers, impute to median
+dataset[dataset[,"BsmtHalfBath"]>=2, "BsmtHalfBath"] <- median(dataset[-which(dataset[,"BsmtHalfBath"] >= 2), "BsmtHalfBath"])
+
+# BsmtFinSF2 => >1000 are outliers, impute to median
+dataset[dataset[,"BsmtFinSF2"] > 1000, "BsmtFinSF2"] <- median(dataset[-which(dataset[,"BsmtFinSF2"] > 1000), "BsmtFinSF2"])
+
+# GrLivArea => >4476 are outliers, impute to median
+dataset[dataset[,"GrLivArea"] > 4476, "GrLivArea"]<- median(dataset[-which(dataset[,"GrLivArea"] > 4476),"GrLivArea"])
+
+# LotArea => >21535 are outliers, impute to median
+dataset[dataset[,"LotArea"] > 21535, "LotArea"]<- median(dataset[-which(dataset[,"LotArea"] > 21535),"LotArea"])
+
+# MiscVal => >=3500 are outliers
+dataset[dataset[, "MiscVal"] >= 3500, "MiscVal"]<- median(dataset[-which(dataset[,"MiscVal"] >= 3500), "MiscVal"])
+```
+
+## Feature Exploration
+
+### Correlation Matrix (Numeric Variables)
+
+First, let's plot the correlation matrix for all the numeric variables:
+```{r}
+# here is the subset of numeric feaures
+numeric_features <- sapply(dataset, class) != "factor"
+
+name_num_features <- names(numeric_features)[numeric_features==TRUE]
+
+dataset_int_num <- dataset[, name_num_features]
+dataset_cor <- cor(dataset_int_num)
+cor_dist <- as.dist((1-dataset_cor)/2)
+cor_clust <- hclust(cor_dist)
+dataset_cor_ordered <-dataset_cor[cor_clust$order, cor_clust$order]
+dataset_cor_ordered[lower.tri(dataset_cor_ordered)]<- NA
+dataset_cor_melt <- melt(dataset_cor_ordered, na.rm = TRUE)
+{
+ggplot(data = dataset_cor_melt, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+   midpoint = 0, limit = c(-1,1), space = "Lab",
+   name="Correlation") +
+  theme_minimal()+
+ theme(axis.text.x = element_text(angle = 90, vjust = 0))+
+ coord_fixed()
+}
+```
+
+Now let's just look at those which have the strongest correlations (>=0.75)
+```{r}
+cor_melt_strong <- dataset_cor_melt[-which(abs(dataset_cor_melt$value)<0.75),]
+cor_melt_strong <- cor_melt_strong[-which(cor_melt_strong$Var2 %in% names(summary(cor_melt_strong$Var2))[summary(cor_melt_strong$Var2)==1 & summary(cor_melt_strong$Var1)==1]),]
+
+{
+ggplot(data = cor_melt_strong, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+   midpoint = 0, limit = c(-1,1), space = "Lab",
+   name="Correlation") +
+    geom_text(aes(Var2, Var1, label = round(value, digits = 2)), color = "black", size = 4) +
+  theme_minimal()+
+ theme(axis.text.x = element_text(angle = 90, vjust = 0))+
+ coord_fixed()
+}
+```
+None of these correlations are strong enough to justify removing any features.
+
+And, finally, let's see how the features correlate with SalePrice 
+```{r}
+sale_price_var2 <- dataset_cor_melt[dataset_cor_melt$Var1 == "SalePrice", c("Var2", "value")]
+colnames(sale_price_var2) <- c("var", "value")
+sale_price_var1 <-dataset_cor_melt[dataset_cor_melt$Var2 == "SalePrice", c("Var1", "value")]
+colnames(sale_price_var1) <- c("var", "value")
+cor_sale_price <- rbind(sale_price_var1, sale_price_var2)
+cor_sale_price <- cor_sale_price[-which(cor_sale_price$var=="SalePrice"),]
+cor_sale_price <- cor_sale_price[order(cor_sale_price$val, decreasing = TRUE),]
+{
+ggplot(data = cor_sale_price, aes(reorder(var, -value),value, fill = value))+
+ geom_bar(stat = "identity") +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+   midpoint = 0, limit = c(-0.35,0.35), space = "Lab",
+   name="Correlation") +
+  theme_minimal()+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0),
+          axis.title.x = element_text(color = "white"))
+}
+```
+
+We saw a rough plot of the features vs. SalePrice in the outlier section, but let's take a closer look now, keeping in mind the correlation values from above.  Here we will get a better sense of which features we can create later on.
+```{r}
+data <- c()
+
+for (name in cor_sale_price$var[1:9]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_point(aes(x=x, y=y)) + labs(x = "SalePrice")
+
+data <- c()
+
+for (name in cor_sale_price$var[10:18]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_point(aes(x=x, y=y)) +  labs(x = "SalePrice")
+
+data <- c()
+
+for (name in cor_sale_price$var[19:24]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_point(aes(x=x, y=y)) +  labs(x = "SalePrice")
+
+data <- c()
+
+for (name in cor_sale_price$var[25:30]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_point(aes(x=x, y=y)) + labs(x = "SalePrice")
+```
+It is clear that there are not enough observations of KitchenAbvGr different than one to give an accurate correlation with SalePrice so we delete the columns
+```{r}
+dataset <- dataset[, -which(names(dataset)=="KitchenAbvGr")]
+```
+
+
+The following features are clearly divided into two groups in terms of their relationship with SalePrice (they are split between homes which have and don't have the feature:
+
+1. OpenPorchSF
+2. WoodDeckSF
+3. X2ndFlrSF
+4. HalfBath
+5. BsmtFullBath
+6. LowQualFinSF
+7. PoolArea
+8. X3SsnPorch
+9. ScreenPorch
+10. BsmtHalfBath
+11. BsmtFinSF2
+12. EnclosedPorch
+13. MiscVal
+
+In the Feature Creation section, these variables will be converted to boolean Y-N factors.
+
+
+### Factor Features
+
+```{r}
+factor_features <- sapply(dataset, class) == "factor"
+
+factor_columns <- names(factor_features)[factor_features==TRUE]
+
+data <- c()
+
+for (name in factor_columns[1:9]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+data <- as.data.table(data)
+data <- data[order(y, decreasing=T)]
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_jitter(aes(y = reorder(y, x, FUN = median), x = x), height = 0.1) + labs(x = "SalePrice", y = "Feature")
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_boxplot(mapping = aes(x = reorder(y, x, FUN = median), y = x)) + coord_flip() + labs(y = "SalePrice", x = "Feature")
+
+
+data <- c()
+
+for (name in factor_columns[10:18]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+data <- as.data.table(data)
+data <- data[order(y, decreasing=T)]
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_jitter(aes(y = reorder(y, x, FUN = median), x = x), height = 0.1) + labs(x = "SalePrice", y = "Feature")
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_boxplot(mapping = aes(x = reorder(y, x, FUN = median), y = x)) + coord_flip() + labs(y = "SalePrice", x = "Feature")
+
+
+data <- c()
+
+for (name in factor_columns[19:27]){
+data <- rbind(data,
+            data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+data <- as.data.table(data)
+data <- data[order(y, decreasing=T)]
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_jitter(aes(y = reorder(y, x, FUN = median), x = x), height = 0.1) + labs(x = "SalePrice", y= "Feature")
+
+ggplot(data=data) +
+  facet_wrap(~version, scales = "free_y") +
+  geom_boxplot(mapping = aes(x = reorder(y, x, FUN = median), y = x)) + coord_flip() + labs(y = "SalePrice", x = "Feature")
+
+
+data <- c()
+
+for (name in factor_columns[28:36]){
+data <- rbind(data,
+           data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+data <- as.data.table(data)
+data <- data[order(y, decreasing=T)]
+
+ggplot(data=data) +
+ facet_wrap(~version, scales = "free_y") +
+ geom_jitter(aes(y = reorder(y, x, FUN = median), x = x), height = 0.1) + labs(x = "SalePrice", y = "Feature")
+
+ggplot(data=data) +
+ facet_wrap(~version, scales = "free_y") +
+ geom_boxplot(mapping = aes(x = reorder(y, x, FUN = median), y = x)) + coord_flip() + labs(y = "SalePrice", x = "Feature")
+
+
+data <- c()
+
+for (name in factor_columns[37:45]){
+data <- rbind(data,
+           data.frame(version=name,x=dataset$SalePrice[dataset$SalePrice>0], y= dataset[dataset$SalePrice>0, name]))
+}
+data <- as.data.table(data)
+data <- data[order(y, decreasing=T)]
+
+ggplot(data=data) +
+ facet_wrap(~version, scales = "free_y") +
+ geom_jitter(aes(y = reorder(y, x, FUN = median), x = x), height = 0.1) + labs(x = "SalePrice", y = "Feature")
+
+ggplot(data=data) +
+ facet_wrap(~version, scales = "free_y") +
+ geom_boxplot(mapping = aes(x = reorder(y, x, FUN = median), y = x)) + coord_flip() + labs(y = "SalePrice", x = "Feature")
+```
+
+These features are clearly divided between having any category value and having a "None" value:
+
+1. MasVnrType 
+2. Paved Drive 
+3. Fence 
+4. Alley
+5. MiscFeature ***but then this will be the same as MiscVal, so we can delete MiscVal
+
+In the Feature Creation section, these variables will be converted to boolean Y-N factors.
+```{r}
+dataset <- dataset[, -which(names(dataset)=="MiscVal")]
+```
+
+
+The following features are clearly divided into two groups in terms of their relationship with SalePrice (they are split between homes which have and don't have a feature category):
+
+1. LotShape (Reg or Not Reg)
+2. LandContour (Lvl or Not Lvl)
+3. LandSlope (Gtl or Not Gtl)
+4. BldgType (1Fam or Not 1Fam)
+5. RoofMatl (CompShg or Not CompShg)
+6. Heating (GasA or Not GasA)
+7. Electrical (SBrkr or Not SBrkr)
+8. Functional (Typ or Not Typ)
+9. SaleType (WD or Not WD)
+10. SaleCond (Norm or Not Norm)
+
+In the Feature Creation section, these varaibles will be converted to boolean X-notX factors.
+
+
+These features have values that are clearly under-represented:
+
+1. MSSubClass
+2. LotConfig
+3. Neighborhood
+4. HouseStyle
+5. Exterior1st
+6. Exterior2nd
+7. Foundation
+8. GarageType
+
+In the Feature Creation section, the under represented values will be grouped to a single "other" value
+
+
+These features clearly have values which can be grouped together:
+
+1. Condition1 (Group the Pos and RR variations)
+2. RoofStyle (Group Gable + Gambrel, and Hip + Mansard + Flat + Shed)
+3. BsmtExp (Group to Yes, No, None)
+4. BsmtFinType1 (Group to None, Unf, <avg, avg, >avg)
+5. BsmtFinType2 (Group to None, Unf, <avg, avg, >avg)
+6. MSZoning (Group RH with RM)
+
+In the Feature Creation section, these features will be binned to these groups.
+
+
+These features can be better represented as numeric values and some are clearly very similar and can be combined to a single feature:
+
+1. ExterQual + ExterCond (convert to numeric rating)
+2. BsmtQual + BsmtCond (convert to numeric rating)
+3. HeatingQC (convert to numeric rating)
+4. KitchenQual (convert to numeric rating)
+5. GarageQual + GarageCond (convert to numeric rating)
+6. FireplaceQu (convert to numeric rating)
+7. GarageYrBuilt (convert to Garage Age) 
+8. YearBuilt + YearRemodAdd (convert to House Age)
+
+In the Feature Creation section, these changes will be implemented.
+
+
+## Skewness
+
+We now need to detect skewness in the Target value. Let's see what is the effect of skewness on a variable, and plot it using ggplot. We will use a `log` transformation to reduce skewness (right skewness). 
+
+```{r}
+df <- rbind(data.frame(version="price",x=original_training_data$SalePrice),
+            data.frame(version="log(price+1)",x=log(original_training_data$SalePrice + 1)))
+
+ggplot(data=df) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x), bins = 50)
+```
+
+We therefore transform the target value applying log
+```{r Log transform the target for official scoring}
+# Log transform the target for official scoring
+dataset$SalePrice <- log1p(dataset$SalePrice)
+```
+
+
+The same "skewness" observed in the target variable also affects other variables. To facilitate the application of the regression model we are going to also eliminate this skewness. For numeric feature with excessive skewness, perform log transformation
+
+We will set up a skewness threshold at 0.75. 
+
+```{r}
+skewness_threshold = 0.75
+```
+
+
+```{r}
+numeric_features <- sapply(dataset, class) != "factor"
+
+numeric_columns <- names(numeric_features)[numeric_features==TRUE]
+```
+
+Compute the skewness of each column whose name is in the list of `numeric_columns`.
+```{r}
+# skew of each variable
+skew <- sapply(numeric_columns, function(x) { 
+    e1071::skewness(dataset[[x]], na.rm = T)
+  }
+)
+```
+
+
+What we do need to make now is to apply the log to those whose skewness value is below a given threshold that we've set in 0.75.
+```{r}
+# transform all variables above a threshold skewness.
+skew <- skew[abs(skew) > skewness_threshold]
+for(x in names(skew)) {
+  dataset[[x]] <- log(dataset[[x]] + 1)
+}
+```
+
+
+
+# Feature Creation
+
+## Boolean Y-N
+
+Here are the 12 numeric features to be converted to boolean Y-N factors:
+1. OpenPorchSF
+2. WoodDeckSF
+3. X2ndFlrSF
+4. HalfBath
+5. BsmtFullBath
+6. LowQualFinSF
+7. PoolArea
+8. X3SsnPorch
+9. ScreenPorch
+10. BsmtHalfBath
+11. BsmtFinSF2
+12. EnclosedPorch
+
+And the 4 factor features which should be collapsed to boolean Y-N factors:
+1. MasVnrType 
+2. Paved Drive 
+3. Fence 
+4. MiscFeature 
+5. Alley
+
+```{r}
+# create a function to take care of this transformation for the regular case
+to_binary <- function(feature){
+  feature <- as.character(feature)
+  feature[(feature == "None") | (feature == "0")] <- "No"
+  feature[feature != "No"] <- "Yes"
+  feature <- as.factor(feature)
+  return(feature)
+}
+
+# list of features to be changed
+to_binary_features <- c("BsmtFinSF2",  "WoodDeckSF", "OpenPorchSF", "EnclosedPorch", "X3SsnPorch", "ScreenPorch", "PoolArea", "Fence", "MiscFeature", "X2ndFlrSF", "LowQualFinSF", "Alley", "MasVnrType", "BsmtFullBath", "BsmtHalfBath", "HalfBath")
+
+# replace original feature with changed feauture
+dataset[, to_binary_features] <- lapply(dataset[,to_binary_features], to_binary)
+
+# PavedDrive has to be done separately since it has "N" instead of "None" or "0"
+PavedDriveBin <- factor(dataset$PavedDrive, labels = c("N", "N", "Y"))
+dataset <- cbind(dataset, PavedDriveBin)
+dataset <- dataset[, -which(names(dataset)=="PavedDrive")]
+```
+
+
+## Boolean X-notX
+
+Here are the 10 factor features that should be collapsed to boolean X-notX factors:
+1. LotShape (Reg or Not Reg)
+2. LandContour (Lvl or Not Lvl)
+3. LandSlope (Gtl or Not Gtl)
+4. BldgType (1Fam or Not 1Fam)
+5. RoofMatl (CompShg or Not CompShg)
+6. Heating (GasA or Not GasA)
+7. Electrical (SBrkr or Not SBrkr)
+8. Functional (Typ or Not Typ)
+9. SaleType (WD or Not WD)
+10. SaleCond (Norm or Not Norm)
+
+```{r}
+# create a function to take care of this transformation
+to_binary_custom <- function(feature, yes_val){
+  feature <- as.character(feature)
+  feature[(feature != yes_val)] <- paste("Not", yes_val)
+  feature <- as.factor(feature)
+  return(feature)
+}
+
+# features to be changed
+to_binary_custom_features <- c("LotShape", "BldgType",  "RoofMatl", "LandContour","LandSlope", "Heating", "Electrical", "Functional", "SaleType", "SaleCondition")
+
+# feature values to be used
+custom_yes_val <- c("Reg", "1Fam", "CompShg", "Lvl", "Gtl", "GasA", "SBrkr", "Typ", "WD", "Normal")
+names(custom_yes_val) <- to_binary_custom_features
+
+# replace the feature with the changed version
+for (f in to_binary_custom_features){
+  dataset[, f] <- to_binary_custom(feature = dataset[, f], yes_val = custom_yes_val[names(custom_yes_val)==f]) 
+}
+```
+
+
+## "Other" Bin
+
+Here are the 8 features which have under-represented values that should be binned as "other"
+1. MSSubClass
+2. LotConfig
+3. Neighborhood
+4. HouseStyle
+5. Exterior1st
+6. Exterior2nd
+7. Foundation
+8. GarageType
+
+```{r}
+# create a function to handle the transformation
+bin_other <- function(feature, low_count){
+  if ("Other" %in% levels(feature) == FALSE){
+      feature <- factor(feature, levels = c(levels(feature), "Other"))
+  }
+  feature[feature %in% names(summary(feature))[summary(feature) < low_count]] <- "Other"
+  feature <- factor(feature, exclude = summary(feature) == 0)
+  return(feature)
+}
+
+# features to be changed
+bin_other_features <- c("MSSubClass", "LotConfig", "Neighborhood", "HouseStyle", "GarageType", "Exterior1st", "Exterior2nd", "Foundation")
+
+# threshold for considering a value under-represented (approx. 10% of the max value)
+low_count_vals <- c(100, 100, 100, 150, 100, 100, 100, 350)
+names(low_count_vals) <- bin_other_features
+
+# replace each feature with the changed one
+for (f in bin_other_features){
+  dataset[, f] <- bin_other(feature = dataset[, f], low_count = low_count_vals[names(low_count_vals)==f]) 
+}
+```
+
+
+## Rebinning
+
+Here are the 6 features which should be rebinned:
+1. Condition1 (Group the Pos and RR variations)
+2. RoofStyle (Group Gable + Gambrel, and Hip + Mansard + Flat + Shed)
+3. BsmtExp (Group to Yes, No, None)
+4. BsmtFinType1 (Group to None, Unf, <avg, avg, >avg)
+5. BsmtFinType2 (Group to None, Unf, <avg, avg, >avg)
+6. MSZoning (Group RH with RM)
+
+```{r}
+# rebin Condition1
+Condition1Bin <- factor(dataset$Condition1, labels = c("Artery", "Feedr", "Norm", "Pos", "Pos", "RR", "RR", "RR", "RR"))
+
+# replace in dataset
+dataset$Condition1 <- Condition1Bin
+
+
+# rebin RoofStyle
+RoofStyleBin <- factor(dataset$RoofStyle, labels = c("group1", "group2", "group2", "group1", "group1", "group1"))
+
+# replace in the dataset
+dataset$RoofStyle <- RoofStyleBin
+
+
+# rebin BsmtExposure
+BsmtExposureBin <- factor(dataset$BsmtExposure, levels = c("Av", "Gd", "Mn", "No", "None"), labels = c("Yes", "Yes", "Yes", "No", "None"))
+
+# replace in the dataset
+dataset$BsmtExposure <- BsmtExposureBin
+
+
+# rebin BsmtFinType1
+BsmtFinType1Bin <- factor(dataset$BsmtFinType1, levels = c("ALQ", "BLQ", "GLQ", "LwQ", "Rec", "Unf", "None"), labels = c("avg", "<avg", ">avg", "<avg", "avg", "Unf", "None"))
+
+# replace in the dataset
+dataset$BsmtFinType1 <- BsmtFinType1Bin
+
+
+# rebin BsmtFinType2
+BsmtFinType2Bin <- factor(dataset$BsmtFinType2, levels = c("ALQ", "BLQ", "GLQ", "LwQ", "Rec", "Unf", "None"), labels = c("avg", "<avg", ">avg", "<avg", "avg", "Unf", "None"))
+
+# replace in dataset
+dataset$BsmtFinType2 <- BsmtFinType2Bin
+
+
+# rebin MSZoning
+MSZoningBin <- factor(dataset$MSZoning, labels = c("C", "FV", "RM", "RL", "RM"))
+
+# replace in dataset
+dataset$MSZoning <- MSZoningBin
+```
+
+
+## Factor to Numeric
+
+Here are the 8 sets of features which should be converted to numeric features
+1. ExterQual + ExterCond (convert to numeric rating)
+2. BsmtQual + BsmtCond (convert to numeric rating)
+3. HeatingQC (convert to numeric rating)
+4. KitchenQual (convert to numeric rating)
+5. GarageQual + Garage Cond (convert to numeric rating)
+6. FireplaceQu (convert to numeric rating)
+7. GarageYrBuilt (convert to Garage Age) 
+8. YearBuilt + YearRemodAdd (convert to House Age)
+```{r}
+# change factor levels to numeric rating levels
+ExterCond <- factor(dataset$ExterCond, labels = c(5, 2, 4, 1, 3))
+ExterQual <- factor(dataset$ExterQual, labels = c(5, 2, 4, 3))
+
+# combine the features
+ExterOverall <- (as.numeric(as.character(ExterCond))+as.numeric(as.character(ExterQual)))/2
+
+# replace in the dataset
+dataset <- cbind(dataset, ExterOverall)
+dataset <- dataset[, -which(names(dataset)=="ExterCond")]
+dataset <- dataset[, -which(names(dataset)=="ExterQual")]
+
+
+# change factor levels to numeric ratings
+BsmtCond <- factor(dataset$BsmtCond, labels = c(2, 4, 1, 3, 0))
+BsmtQual <- factor(dataset$BsmtQual, labels = c(5, 2, 4, 3, 0))
+
+# combine the features
+BsmtOverall <- (as.numeric(as.character(BsmtCond))+as.numeric(as.character(BsmtQual)))/2
+
+# replace in the dataset
+dataset <- cbind(dataset, BsmtOverall)
+dataset <- dataset[, -which(names(dataset)=="BsmtCond")]
+dataset <- dataset[, -which(names(dataset)=="BsmtQual")]
+
+
+# change factor to numeric ratings
+HeatingQC <- as.numeric(as.character(factor(dataset$HeatingQC, labels = c(5, 2, 4, 1,3))))
+
+# replace in the dataset
+dataset$HeatingQC <- HeatingQC
+
+
+# change factor to numeric ratings
+KitchenQual <- as.numeric(as.character(factor(dataset$KitchenQual, labels = c(5,2,4,3))))
+
+# replace in the dataset
+dataset$KitchenQual <- KitchenQual
+
+
+# change factor to numeric ratings
+GarageCond <- factor(dataset$GarageCond, labels = c(5,2,4,1,3,0))
+GarageQual <- factor(dataset$GarageQual, labels = c(5,2,4,1,3,0))
+
+# combine the features
+GarageOverall<-(as.numeric(as.character(GarageCond))+as.numeric(as.character(GarageQual)))/2
+
+# replace in the dataset
+dataset <- cbind(dataset, GarageOverall)
+dataset <- dataset[, -which(names(dataset)=="GarageCond")]
+dataset <- dataset[, -which(names(dataset)=="GarageQual")]
+
+
+# change factor to numeric ratings
+FireplaceQu <- as.numeric(as.character(factor(dataset$FireplaceQu, labels = c(5,2,4,1,3,0))))
+
+# replace in the dataset
+dataset$FireplaceQu <- FireplaceQu
+
+
+# GarageAge = YrSold - GarageYrBlt
+GarageAge <- as.numeric(as.character(dataset$YrSold)) - as.numeric(as.character(dataset$GarageYrBlt))
+
+# replace in the dataset
+dataset <- cbind(dataset, GarageAge)
+dataset <- dataset[, -which(names(dataset)=="GarageYrBlt")]
+
+
+# HouseAge = YrSold - YearRemodAdd 
+HouseAge <- as.numeric(as.character(dataset$YrSold)) - as.numeric(as.character(dataset$YearRemodAdd))
+
+# replace in the dataset
+dataset <- cbind(dataset, HouseAge)
+dataset <- dataset[, -which(names(dataset)=="YearBuilt")]
+dataset <- dataset[, -which(names(dataset)=="YearRemodAdd")]
+
+```
+
+
+## Misc 
+
+Miscellaneous Feature Creation
+```{r}
+# create QuarterSold (QSold)
+QSold <- factor(dataset$MoSold, levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"), labels = c("1", "1", "1", "2", "2", "2", "3", "3", "3", "4", "4", "4"))
+
+# add to dataset
+dataset <- cbind(dataset, QSold)
+```
+
+
+# Train, Validation Spliting
+
+To facilitate the data cleaning and feature engineering we merged train and test datasets. We now split them again to create our final model.
+
+```{r Train test split}
+training_data <- dataset[1:1460,]
+test <- dataset[1461:2919,]
+```
+
+We are going to split the annotated dataset in training and validation for the later evaluation of our regression models
+```{r Train Validation split}
+# I found this function, that is worth to save for future ocasions.
+splitdf <- function(dataframe, seed=NULL) {
+  if (!is.null(seed)) set.seed(seed)
+ 	index <- 1:nrow(dataframe)
+ 	trainindex <- sample(index, trunc(length(index)/1.5))
+ 	trainset <- dataframe[trainindex, ]
+ 	testset <- dataframe[-trainindex, ]
+ 	list(trainset=trainset,testset=testset)
+}
+splits <- splitdf(training_data, seed=1)
+training <- splits$trainset
+validation <- splits$testset
+```
+
+# Feature Selection
+We here start the Feature Selection.
+
+## Filtering Methods
+We will rank the features according to their predictive power according to the methodologies seen in class: the Chi Squared Independence test and the Information Gain.
+
+
+#### Full Model
+
+Let's try first a baseline including all the features to evaluate the impact of the feature engineering.
+
+```{r message=FALSE, warning=FALSE}
+lm.model(training, validation, "Baseline")
+```
+
+### Chi-squared Selection
+Let's use the chisq.test included in the base package of R, to measure the relationship between the categorical features and the output.
+
+```{r warning=FALSE}
+# Compute the ChiSquared Statistic over the factor features ONLY
+features <- names(training[, sapply(training, is.factor) & colnames(training) != 'SalePrice'])
+chisquared <- data.frame(features, statistic = sapply(features, function(x) {
+  chisq.test(training$SalePrice, training[[x]])$statistic
+}))
+
+# Plot the result, and remove those below the 1st IQR (inter-quartile-range) --aggressive
+par(mfrow=c(1,2))
+boxplot(chisquared$statistic)
+bp.stats <- as.integer(boxplot.stats(chisquared$statistic)$stats)   # Get the statistics from the boxplot
+
+chisquared.threshold = bp.stats[2]  # This element represent the 1st quartile.
+text(y = bp.stats, labels = bp.stats, x = 1.3, cex=0.7)
+barplot(sort(chisquared$statistic), names.arg = chisquared$features, cex.names = 0.6, las=2, horiz = T)
+abline(v=chisquared.threshold, col='red')  # Draw a red line over the 1st IQR
+```
+
+Now, we can test if this a good move, by removing any feature with a Chi Squared test statistic against the output below the 1 IQR.
+
+```{r message=FALSE, warning=FALSE}
+# Determine what features to remove from the training set.
+features_to_remove <- as.character(chisquared[chisquared$statistic < chisquared.threshold, "features"])
+lm.model(training[!names(training) %in% features_to_remove], validation, "ChiSquared Model")
+```
+
+The results are not an improvement on the baseline!
+
+### Now, Try with Spearman's correlation.
+
+Let's repeat the same process we did with the Chi Square but modifying our code to solely select numerical features and measuring Spearman'.
+
+```{r}
+# Compute the Spearman Correlation over the numeric features ONLY
+features <- names(training[, sapply(training, is.numeric) & colnames(training) != 'SalePrice'])
+
+spearman <- data.frame(features, statistic = sapply(features, function(x) {
+  cor(training$SalePrice, training[[x]], method='spearman')
+}))
+
+# Plot the result, and remove those below the 1st IQR (inter-quartile-range) --aggressive
+par(mfrow=c(1,2))
+boxplot(abs(spearman$statistic))
+bp.stats <- boxplot.stats(abs(spearman$statistic))$stats   # Get the statistics from the boxplot
+text(y = bp.stats, 
+     labels = sapply(bp.stats, function(x){format(round(x, 3), nsmall=3)}), # This is to reduce the nr of decimals
+     x = 1.3, cex=0.7)
+
+spearman.threshold = bp.stats[2]  # This element represent the 1st quartile.
+
+barplot((abs(spearman$statistic)), names.arg = spearman$features, cex.names = 0.6, las=2, horiz = T)
+abline(v=spearman.threshold, col='red')  # Draw a red line over the 1st IQR
+```
+Let's train the model with the new features, exactly as we did in the Chi Sq. section above.
+
+```{r message=FALSE, warning=FALSE}
+# Determine what features to remove from the training set.
+features_to_remove <- as.character(spearman[abs(spearman$statistic) < spearman.threshold, "features"])
+lm.model(training[!names(training) %in% features_to_remove], validation, "Spearman")
+```
+
+This was also not an improvement.
+
+
+### Information Gain Selection
+
+This part is equivalent to the Chi Squared, but with another metric.
+
+```{r}
+# Compute the Information Gain Selection over the factor features ONLY
+features <- names(training[, sapply(training, is.factor) & colnames(training) != 'SalePrice'])
+data <- c(features, "SalePrice")
+infGain <- data.frame(information.gain(SalePrice~., training[data]))
+infGain$features <- rownames(infGain)
+
+# Plot the result, and remove those below the 1st IQR (inter-quartile-range) --aggressive
+par(mfrow=c(1,2))
+boxplot(infGain$attr_importance)
+bp.stats <- as.numeric(boxplot.stats(infGain$attr_importance)$stats)   # Get the statistics from the boxplot
+
+infGain.threshold = bp.stats[2]  # This element represent the 1st quartile.
+text(y = bp.stats, labels = bp.stats, x = 1.3, cex=0.7)
+barplot(sort(infGain$attr_importance), names.arg = infGain$features, cex.names = 0.6, las=2, horiz = T)
+abline(v=infGain.threshold, col='red')  # Draw a red line over the 1st IQR
+```
+```{r}
+# Determine what features to remove from the training set.
+features_to_remove <- as.character(infGain[infGain$attr_importance < infGain.threshold, "features"])
+lm.model(training[!names(training) %in% features_to_remove], validation, "Information Gain Model")
+```
+This was an improvement on the baseline model.
+
+
+
+Going forward we can consider working with the following training/validation datasets:
+```{r}
+features_to_remove <- as.character(infGain[infGain$attr_importance < infGain.threshold, "features"])
+
+#training <- training[!names(training) %in% features_to_remove]
+#validation <- validation[!names(validation) %in% features_to_remove]
+```
+
+## Wrapper Methods
+
+We experiment with the wrapper methods, but there was not a significant improvement on the baseline model, and the training time was long, so we won't use this method.  
+
+### Backward Stepwise
+
+Firstly, we try backward stepwise.
+
+```{r Backward Stepwise}
+# train_control_config_4_stepwise <- trainControl(method = "none")
+# 
+# backward <- train(SalePrice ~ ., data = training, 
+#                method = "glmStepAIC", 
+#                direction = "backward",
+#                trace = FALSE,
+#                trControl=train_control_config_4_stepwise)
+```
+
+Test the model with only the selected features.
+
+```{r Selected Backward Features}
+# # Determine what features to remove from the training set.
+# imp_features <- as.character(names(backward$finalModel$coefficients)[-1])
+# 
+# features_to_keep <-c()
+# for (name in names(training)){
+#   detect <- str_detect(imp_features, as.character(name))
+#   features_to_keep <- c(features_to_keep, sum(detect == TRUE))
+# }
+# names(features_to_keep) <- names(training)
+# 
+# lm.model(training[c(names(training)[features_to_keep>0], "SalePrice")], validation, "Backward Wrapper Model")
+```
+
+### Forward Stepwise
+
+```{r}
+# train_control_config_4_stepwise <- trainControl(method = "none")
+# 
+# forward <- train(SalePrice ~ ., data = training, 
+#                method = "glmStepAIC", 
+#                direction = "forward",
+#                trace = FALSE,
+#                trControl=train_control_config_4_stepwise)
+```
+
+```{r}
+# # Determine what features to remove from the training set.
+# imp_features <- as.character(names(forward$finalModel$coefficients)[-1])
+# 
+# features_to_keep <-c()
+# for (name in names(training)){
+#   detect <- str_detect(imp_features, as.character(name))
+#   features_to_keep <- c(features_to_keep, sum(detect == TRUE))
+# }
+# names(features_to_keep) <- names(training)
+# 
+# lm.model(training[c(names(training)[features_to_keep>0], "SalePrice")], validation, "Forward Wrapper Model")
+```
+
+## Embedded
+
+Finally, we will experiment with embedded methods.
+
+### Ridge Regression
+
+We fit a glmnet model for Ridge Regression, using a grid of lambda values.
+
+```{r Ridge Regression, warning=FALSE}
+lambdas <- 10^seq(-3, 0, by = .05)
+
+set.seed(121)
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+ridge.mod <- train(SalePrice ~ ., data = training, 
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 0, lambda = lambdas))
+```
+
+#### Evaluation
+
+Plotting the RMSE for the different lambda values, we can see the impact of this parameter in the model performance.
+
+```{r Ridge RMSE}
+plot(ridge.mod)
+```
+
+Plotting the coefficients for different lambda values. 
+```{r Ridge Coefficients}
+plot(ridge.mod$finalModel)
+```
+
+```{r Ridge Evaluation}
+ridge.mod.pred <- predict(ridge.mod, validation)
+ridge.mod.pred[is.na(ridge.mod.pred)] <- 0
+
+my_data <- as.data.frame(cbind(predicted=(exp(ridge.mod.pred) -1), observed=(exp(validation$SalePrice) -1)))
+ridge.mod.rmse <- sqrt(mean((ridge.mod.pred - validation$SalePrice)^2))
+ridge.mod.price_error <- mean(abs((exp(ridge.mod.pred) -1) - (exp(validation$SalePrice) -1)))
+
+ggplot(my_data, aes(predicted, observed)) +
+    geom_point() + geom_smooth(method = "glm") +
+    labs(x="Predicted") +
+    ggtitle(ggtitle(paste("Ridge", 'RMSE: ', format(round(ridge.mod.rmse, 4), nsmall=4), ' --> Price ERROR:', format(round(ridge.mod.price_error, 0), nsmall=0), 
+                         sep=''))) +  
+    scale_x_continuous(labels = scales::comma) + 
+    scale_y_continuous(labels = scales::comma)
+```
+
+
+Rank the variables according to the importance attributed by the model.
+```{r}
+# Print, plot variable importance
+plot(varImp(ridge.mod), top = 20) # 20 most important features
+```
+This was an improvement on the baseline model.
+
+### Lasso Regresion
+
+```{r Lasso Regression, warning=FALSE}
+lambdas <- 10^seq(-3, 0, by = .05)
+
+set.seed(121)
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+lasso.mod <- train(SalePrice ~ ., data = training, 
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 1, lambda = lambdas))
+```
+
+#### Evaluation
+
+Plotting the RMSE for the different lambda values, we can see the impact of this parameter in the model performance.
+
+```{r Lasso RMSE}
+plot(lasso.mod)
+```
+
+Plotting the coefficients for different lambda values. 
+```{r Lasso Coefficients}
+plot(lasso.mod$finalModel)
+```
+
+```{r Lasso Evaluation}
+lasso.mod.pred <- predict(lasso.mod, validation)
+lasso.mod.pred[is.na(lasso.mod.pred)] <- 0
+
+my_data <- as.data.frame(cbind(predicted=(exp(lasso.mod.pred) -1), observed=(exp(validation$SalePrice) -1)))
+lasso.mod.rmse <- sqrt(mean((lasso.mod.pred - validation$SalePrice)^2))
+lasso.mod.price_error <- mean(abs((exp(lasso.mod.pred) -1) - (exp(validation$SalePrice) -1)))
+
+ggplot(my_data, aes(predicted, observed)) +
+    geom_point() + geom_smooth(method = "glm") +
+    labs(x="Predicted") +
+    ggtitle(ggtitle(paste("Lasso", 'RMSE: ', format(round(lasso.mod.rmse, 4), nsmall=4), ' --> Price ERROR:', format(round(lasso.mod.price_error, 0), nsmall=0), 
+                         sep=''))) +  
+    scale_x_continuous(labels = scales::comma) + 
+    scale_y_continuous(labels = scales::comma)
+```
+
+
+Rank the variables according to the importance attributed by the model.
+```{r}
+# Print, plot variable importance
+plot(varImp(lasso.mod), top = 20) # 20 most important features
+```
+This was an improvement on the baseline model.  Furthermore, it performs better without first filtering out the unimportant features from Information Gain.
+
+# Final Submission
+
+Based on our analysis, we have to decide which cleaning and feature engineering procedures make sense in order to create your final model.
+We split the original training data into train and validation to evaluate the candidate models. In order to generate the final submission we have to take instead all the data at our disposal.
+In addition, remember that we also applied a log transformation to the target variable, to revert this transformation we use the exp function.
+
+```{r Final Submission}
+# Train the model using all the data
+final.model <- train(SalePrice ~ ., data = training, 
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 1, lambda = lambdas))
+
+# Predict the prices for the test data (i.e., we use the exp function to revert the log transformation that we applied to the target variable)
+final.pred <- as.numeric(exp(predict(final.model, test))-1) 
+final.pred[is.na(final.pred)]
+hist(final.pred, main="Histogram of Predictions", xlab = "Predictions")
+
+lasso_submission <- data.frame(Id = original_test_data$Id, SalePrice= (final.pred))
+colnames(lasso_submission) <-c("Id", "SalePrice")
+write.csv(lasso_submission, file = "submission.csv", row.names = FALSE) 
+```

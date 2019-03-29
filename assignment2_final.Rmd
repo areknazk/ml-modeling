@@ -1,0 +1,2002 @@
+---
+title: "Assignment2: Tanzanian Water Pumps"
+author: "Duarte Afonso, Abhy Choumal, Areknaz Khaligian, Conrad Lee"
+output: 
+  html_document: 
+    toc: true
+---
+# Set-Up
+
+These are the necessary libraries to run the markdownn.
+```{r}
+# load libraries
+library(data.table)
+library(randomForest)
+library(tree)
+library(ggplot2)
+library(e1071)
+library(dplyr)
+library(stringr)
+library(stringdist)
+library(qdap)
+library(caret)
+```
+
+## external sources
+https://rpubs.com/jt_rpubs/339668
+
+Here we load the data csv's and combine the target variable information with the corresponding training features
+```{r}
+# load data
+train <- as.data.table(read.csv("data/training_data.csv"))
+target <- as.data.table(read.csv("data/training_target.csv"))
+test <- as.data.table(read.csv("data/test_data.csv"))
+
+# concatenate the training data with the target variable
+train_target <- cbind(train, target[,"status_group"])
+```
+
+# Data Exploration
+
+First we concatenate the train and test data so we can see what all the data looks like.
+(To be able to combine train and test we need to have the same columns, specifically the target column, so we will create a new test dataset with "unknown for the "status_group" column.)
+```{r}
+test_target <- data.table(test, status_group="unknown")
+data <- rbind(train_target, test_target)
+```
+
+Now we'll take a look at the summary of all the columns to see what kind of data we are working with:
+```{r}
+summary(data)
+```
+## Removing useless features
+
+The "id" feature is a unique row identifier, and the "recorded_by" feature is the same for each row so we remove them from the data.
+```{r}
+data <- data[,-c("id", "recorded_by")]
+```
+
+## Features [Data Exploration]
+
+###  permit & public_meeting
+These are initial plots to understand the distibution in terms of status_group, as well as the proportion of each feature level that faalls into the status_group levels.  Note that there are "None" values which can be viewed as NA's, and it is not clear that they should fall into the True or False categories.
+```{r}
+plot_data <- c()
+frame_data <- as.data.frame(data)
+for (name in c("permit", "public_meeting")){
+plot_data <- rbind(plot_data,
+            data.frame(version=name,x=data$status_group[data$status_group != "unknown"], y= frame_data[data$status_group != "unknown", name]))
+}
+plot_data <- as.data.table(plot_data)
+
+ggplot(data=plot_data) +
+  facet_wrap(~version) +
+  geom_bar(aes(x = y, fill = x)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+data[data$status_group!="unknown",list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")})),by = permit, .SDcols="status_group"][order(as.numeric(prop_fun), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")})),by = permit, .SDcols="status_group"][order(as.numeric(prop_repair), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")})),by = permit, .SDcols="status_group"][order(as.numeric(prop_nofun), decreasing = TRUE)]
+
+
+data[data$status_group!="unknown",list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")})),by = public_meeting, .SDcols="status_group"][order(as.numeric(prop_fun), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")})),by = public_meeting, .SDcols="status_group"][order(as.numeric(prop_repair), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")})),by = public_meeting, .SDcols="status_group"][order(as.numeric(prop_nofun), decreasing = TRUE)]
+```
+
+
+### payment& payment type
+Since payment and payment_type are exactly the same we will remove "payment"
+And, never_pay, unknown are the "bad" payment_types (the others are all more likely to be good than bad) We could consider binning these in the feature creation section, but since there isn't a huge imbalance between factor levels, it is better to keep the granularity of the different groups.
+```{r}
+ggplot(data= data) +
+  geom_bar(aes(x = data$payment, fill = data$payment_type)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+
+```{r}
+data <- data[,-c("payment")]
+```
+
+```{r}
+ggplot(data = data[data$status_group!="unknown"]) +
+  geom_bar(aes(x = payment_type, fill = status_group)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+data[data$status_group!="unknown",list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")})),by = payment_type, .SDcols="status_group"][order(as.numeric(prop_fun), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")})),by = payment_type, .SDcols="status_group"][order(as.numeric(prop_repair), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")})),by = payment_type, .SDcols="status_group"][order(as.numeric(prop_nofun), decreasing = TRUE)]
+```
+
+### date_recorded
+There are definitely some times of the year when recordings happen less often, but there is no clear trend with the target.  We will add these date levels into the dataset now, so we can use them with the other features.  (In the feature creation section we will check to make sure they are necessary for the model)
+```{r}
+# playing with date_recorded
+
+# format as Date
+date_asDate <- as.Date(data$date_recorded)
+
+# create year, month, quarter, and week features
+year_asDate <- factor(year(date_asDate))
+month_asDate <- factor(month(date_asDate))
+quarter_asDate <- factor(quarter(date_asDate))
+week_asDate <- factor(week(date_asDate))
+
+# add new features to the dataset
+data <- cbind(data, year_asDate, month_asDate, quarter_asDate, week_asDate)
+
+# visualize date features
+frame_data <- as.data.frame(data)
+
+plot_data <- rbind(
+  data.frame(version="year",x=data$status_group[data$status_group != "unknown"], y= frame_data[data$status_group != "unknown", "year_asDate"]),
+  data.frame(version="quarter",x=data$status_group[data$status_group != "unknown"], y= frame_data[data$status_group != "unknown", "quarter_asDate"]),
+  data.frame(version="month",x=data$status_group[data$status_group != "unknown"], y= frame_data[data$status_group != "unknown", "month_asDate"]),
+  data.frame(version="week",x=data$status_group[data$status_group != "unknown"], y= frame_data[data$status_group != "unknown", "week_asDate"]))
+
+plot_data <- as.data.table(plot_data)
+
+ggplot(data=plot_data) +
+  facet_wrap(~version, scales = "free", nrow = 2) +
+  geom_bar(aes(x = y, fill = x)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+
+
+### construction year
+Older construction years have a higher proportion of failed pumps.  Around 1999 there is a flip in having more good pumps than bad, and before 1979 more pumps are bad than good.  
+```{r}
+# convert to factor for visualization
+data$construction_year <- as.factor(data$construction_year)
+
+# looking more closely at construction year, with and without zeros
+frame_data <- as.data.frame(data)
+
+plot_data <- rbind(
+  data.frame(version="0",x=data$status_group[data$status_group != "unknown" & data$construction_year == 0], y= frame_data[data$status_group != "unknown" & data$construction_year == 0, "construction_year"]),
+  data.frame(version="year",x=data$status_group[data$status_group != "unknown" & data$construction_year != 0], y= frame_data[data$status_group != "unknown" & data$construction_year != 0, "construction_year"]))
+
+plot_data <- as.data.table(plot_data)
+
+ggplot(data=plot_data) +
+  facet_wrap(~version, scales = "free", nrow = 2) +
+  geom_bar(aes(x = y, fill = x)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+
+# comparing proportion of functionalities accross years
+construct_data <- data[data$status_group!="unkown", c(list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")}), prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")}), prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")}))), by = construction_year, .SDcols="status_group"][order(construction_year, decreasing = FALSE)]
+
+construct_data$prop_fun <- as.numeric(construct_data$prop_fun)
+construct_data$prop_repair <- as.numeric(construct_data$prop_repair)
+construct_data$prop_nofun <- as.numeric(construct_data$prop_nofun)
+
+construct_data_nozero <- construct_data[construct_data$construction_year!=0]
+
+
+ggplot(data = construct_data_nozero)+
+  geom_point(aes(x = construction_year, y = prop_fun, color = 'prop_fun'))+
+  geom_point(aes(x = construction_year, y = prop_repair, color = "prop_repair"))+
+  geom_point(aes(x = construction_year, y = prop_nofun, color = "prop_nofun"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "proportion") +
+  scale_color_discrete(name = "status_group")+
+  scale_color_manual(values=c("green", "red", "yellow"))+
+  geom_hline(yintercept = 1, linetype="dashed")
+
+# convert back to numeric
+data$construction_year <- as.numeric(data$construction_year)
+```
+     
+Looks like construction_year == 0 is more similar to the years between 1979 and 1999, but prop_fun > prop_nofun so maybe somewhere in the 1989-1999 range.  But, this could also be because it is an average value over the many zero values.  We will devise a way to impute the zeros in the Imputing NA's section
+```{r}
+construct_data[construction_year==0]
+```
+
+### num_private
+There are definitely some outliers in num_private
+Also, less than 1000 are different from zero, so maybe we will need to drop this
+```{r}
+# convert to factor for visualization
+data$num_private <- as.factor(data$num_private)
+# looking more closely at num_private, with and without zeros
+
+frame_data <- as.data.frame(data)
+
+plot_data <- rbind(
+  data.frame(version="0",x=data$status_group[data$status_group != "unknown" & data$num_private == 0], y= frame_data[data$status_group != "unknown" & data$num_private == 0, "num_private"]),
+  data.frame(version="year",x=data$status_group[data$status_group != "unknown" & data$num_private != 0], y= frame_data[data$status_group != "unknown" & data$num_private != 0, "num_private"]))
+
+plot_data <- as.data.table(plot_data)
+
+ggplot(data=plot_data) +
+  facet_wrap(~version, scales = "free", nrow = 2) +
+  geom_bar(aes(x = y, fill = x)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+# no pattern in specific prop_fun vals
+num_private_fun <- data[data$status_group!="unknown",list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")})),by = num_private, .SDcols="status_group"][order(as.numeric(prop_fun), decreasing = TRUE)]
+num_private_fun[prop_fun!= Inf & prop_fun!=0]
+
+num_private_repair <- data[data$status_group!="unknown",list(prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")})),by = num_private, .SDcols="status_group"][order(as.numeric(prop_repair), decreasing = TRUE)]
+num_private_repair[prop_repair!= Inf & prop_repair!=0]
+
+num_private_nofun <- data[data$status_group!="unknown",list(prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")})),by = num_private, .SDcols="status_group"][order(as.numeric(prop_nofun), decreasing = TRUE)]
+num_private_nofun[prop_nofun!= Inf & prop_nofun!=0]
+
+data[data$status_group!="unknown",list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")})),by = list(num_private0 =num_private==0), .SDcols="status_group"][order(as.numeric(prop_fun), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")})),by = list(num_private0 =num_private==0), .SDcols="status_group"][order(as.numeric(prop_repair), decreasing = TRUE)]
+
+data[data$status_group!="unknown",list(prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")})),by = list(num_private0 =num_private==0), .SDcols="status_group"][order(as.numeric(prop_nofun), decreasing = TRUE)]
+```
+     
+So there are more functioning/less non functioning in num_private != 0, but the proportion of functioning is greater than one in both cases.
+We can't find a meaningful explanation of num_private in terms of status_group so we will remove it:
+```{r}
+data <- data[,-c("num_private")]
+```
+
+
+### population
+First we visualize population in terms of status group:
+```{r}
+# population and status group
+
+ggplot(data=data[data$status_group != "unknown" & data$population>0 & data$population < 1500]) +
+  facet_wrap(~status_group, ncol = 1) +
+  geom_histogram(aes(x = population), binwidth = 50 ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+     
+Also, it seems like values above 1500 are outliers, let's visualize those too:
+```{r}
+# population and status group
+
+ggplot(data=data[data$status_group != "unknown" & data$population==0])+
+  geom_bar(aes(x = population, fill = status_group) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = 0")
+
+pop_wayout <- data$population
+pop_wayout[pop_wayout<=1500] <- 0
+pop_wayout[pop_wayout>1500] <- 1
+
+data <- cbind(data,pop_wayout)
+
+ggplot(data=data[data$status_group != "unknown" & data$pop_wayout==1])+
+  geom_bar(aes(x = pop_wayout, fill = status_group) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = high outlier")
+```
+
+     
+Definitely a lot of outliers in population..
+But after narrowing the view to normal values we see that very low population have the most functional and non functional pumps, after that there is a decrease in functionality as population increases, and constant non functionality.  But this trend is partly because the larger population sizes are much less common.
+     
+Let's see how the population feature looks in the time graph we used for construction_year:
+```{r}
+pop_bin <- cut(data$population, breaks = c(-0.1,0, seq(1, 1550, 50), max(data$population)))
+
+# we add this to the dataset to make the visualization easier
+data <- cbind(data,pop_bin)
+
+pop_data <- data[data$status_group!="unkown", c(list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")}), prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")}), prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")}))), by = pop_bin, .SDcols="status_group"][order(pop_bin, decreasing = FALSE)]
+
+
+pop_data$prop_fun <- as.numeric(pop_data$prop_fun)
+pop_data$prop_repair <- as.numeric(pop_data$prop_repair)
+pop_data$prop_nofun <- as.numeric(pop_data$prop_nofun)
+pop_bin_num <- as.numeric(pop_data$pop_bin)
+pop_data <- cbind(pop_data, pop_bin_num)
+
+pop_data_nozero <- pop_data[pop_data$pop_bin_num>1]
+
+ggplot(data = pop_data)+
+  geom_point(aes(x = pop_bin_num, y = prop_fun, color = 'prop_fun'))+
+  geom_point(aes(x = pop_bin_num, y = prop_repair, color = "prop_repair"))+
+  geom_point(aes(x = pop_bin_num, y = prop_nofun, color = "prop_nofun"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "proportion") +
+  scale_color_discrete(name = "status_group")+
+  scale_color_manual(values=c("green", "red", "yellow"))+
+  geom_hline(yintercept = 1, linetype="dashed")+
+  scale_x_continuous(labels= pop_data$pop_bin, breaks = pop_data$pop_bin_num)
+
+# drop pop_bin from the dataset now that we are done with it
+data <- data[, -("pop_bin")]
+```
+     
+We need to impute the zeros to see things more clearly (see Imputing NA's section) 
+
+
+### amount_tsh (Total Static Head)
+
+Total Static Head is the "the vertical height of a stationary column of liquid produced by a pump." It can also be thought of as the amount of water available to a waterpoint. In other words, it is the height at which a pump can raise water above its source. Therefore, a pump with a total static head value of zero would not be particularly useful since it would not be capable of producing water from a source located below its output point.
+
+The variable "amount_tsh" in our dataset contains roughly 52,000 zero values, which is around 70% of the total train and target data. It seems unlikely that these are actually zero values in reality. Thus, we need to find a way to impute a reasonable estimate for the missing values.
+
+Given our understanding of source, extraction, and waterpoint, we assume that there may be some relationship with total static head, that we can use to impute the missing values (see Impute NA's section)
+
+Source: https://rpubs.com/jt_rpubs/339668
+
+
+``` {r}
+# amount_tsh
+table(data$amount_tsh)
+
+# remove the zeroes from amount_tsh
+new_tsh <- data$amount_tsh[data$amount_tsh != 0]
+
+# plot new_tsh
+hist(new_tsh)
+
+# plot new_tsh with a log transformation
+hist(log(new_tsh))
+
+```
+
+### Extraction Type
+
+It looks like extraction_type_group is simply a composite of extraction_type that consolidates a few levels.
+
+For example, "submersible" and "ksb" have been consolidated into the single "submersible" category in extraction_type_group.
+
+Extraction_type_class is a further aggregation of the extraction_type categories.
+
+We try removing various combination of the 3 variables, but all of them result in a lower accuracy. As a result, we keep all of them in the model for now.
+
+``` {r}
+# extracion_type
+levels(data$extraction_type)
+sort(table(data$extraction_type), decreasing = T)
+
+```
+
+``` {r}
+# extracion_type_group
+levels(data$extraction_type_group)
+sort(table(data$extraction_type_group), decreasing = T)
+
+```
+
+``` {r}
+# extracion_type_class
+levels(data$extraction_type_class)
+sort(table(data$extraction_type_class), decreasing = T)
+
+```
+
+``` {r}
+# Remove extraction_type
+# data <- data[,-c("extraction_type")]
+# data <- data[,-c("extraction_type_group")]
+# data <- data[,-c("extraction_type_class")]
+# data <- data[,-c("extraction_type", "extraction_type_group")]
+# data <- data[,-c("extraction_type", "extraction_type_class")]
+# data <- data[,-c("extraction_type_class", "extraction_type_group")]
+
+# Keeping all 3 variables results in the highest accuracy.
+```
+
+### Water Quality
+
+It looks like water_quality and quality_group are similar. Quality_group is simply a composite of water_quality that consolidates a few levels.
+
+For example, "salty" and "salty abandoned" have been consolidated into the "salty" category in quality_group.
+
+We remove water_quality (and keep only quality_group) since it increases accuracy.
+
+``` {r}
+# water_quality
+levels(data$water_quality)
+sort(table(data$water_quality), decreasing = T)
+
+```
+
+``` {r}
+# quality_group
+levels(data$quality_group)
+sort(table(data$quality_group), decreasing = T)
+
+```
+
+``` {r}
+# Remove water_quality
+data <- data[,-c("water_quality")]
+
+```
+
+### Water Quantity
+
+It looks like quantity and quantity_group are duplicates. We remove quantity_group since it increases accuracy.
+
+``` {r}
+# quantity
+levels(data$quantity)
+sort(table(data$quantity), decreasing = T)
+
+```
+
+``` {r}
+# quantity_group
+levels(data$quantity_group)
+sort(table(data$quantity_group), decreasing = T)
+
+```
+
+``` {r}
+# Remove quantity_group
+data <- data[,-c("quantity_group")]
+
+```
+
+### Source
+
+We can see that there is significant overlap between "source" and "source_type". There are some minor differences. For example, "machine dbh" and "hand dtw" have been consolidated into "borehold" in source_type.
+
+Source_class seems to be a more general variable, and only contains three levels (groundwater, surface, and unknown).
+
+We try removing various combinations of the three overlapping variables. Most of them result in reduced accuracy. The only exception is removing "source" (but keeping source_type and source_class).
+
+We remove source, and keep source_type and source_class.
+
+``` {r}
+# source
+# anyNA(data$source)
+levels(data$source)
+sort(table(data$source), decreasing = T)
+
+```
+
+``` {r}
+# source_type
+# anyNA(data$source_type)
+levels(data$source_type)
+sort(table(data$source_type), decreasing = T)
+
+```
+
+``` {r}
+# source_class
+# anyNA(data$source_class)
+levels(data$source_class)
+sort(table(data$source_class), decreasing = T)
+
+```
+
+``` {r}
+# Remove source_type and source_class
+# data <- data[,-c("source_type", "source_class")]
+# data <- data[,-c("source", "source_type")]
+# data <- data[,-c("source", "source_class")]
+# data <- data[,-c("source")]
+# data <- data[,-c("source_type")]
+# data <- data[,-c("source_class")]
+
+data <- data[,-c("source")]
+
+```
+
+### Waterpoint
+
+It looks like waterpoint_type and waterpoint_type_group are basically the same, except that waterpoint_type_group consolidates "communal standpipe" and "communal standpipe multiple" into one group.
+
+Based on this, we consider removing waterpoint_type_group, and just keeping waterpoint_type. However, it looks like removing waterpoint_type_group reduces the baseline accuracy.
+
+Fir now, we retain both variables in the data set.
+
+``` {r}
+# waterpoint_type
+# anyNA(data$waterpoint_type)
+levels(data$waterpoint_type)
+sort(table(data$waterpoint_type), decreasing = T)
+
+```
+
+``` {r}
+# waterpoint_type_group
+# anyNA(data$waterpoint_type_group)
+levels(data$waterpoint_type_group)
+sort(table(data$waterpoint_type_group), decreasing=T)
+
+```
+
+
+```{r}
+# Remove waterpoint_type_group
+# data <- data[,-c("waterpoint_type_group")]
+
+```
+
+# Imputing NA's/Outliers
+
+There are missing values in some of the features.  We need to make decisions on how to deal with them before we can continue.
+
+## Features [Imputing NA's]
+
+### scheme_name
+
+```{r scheme_name}
+## First lets create a function in order to clean the data and try to make it standardized
+clean_text <- function(x){
+  # String normalization
+  x <- as.factor(tolower(x)) # Transform to upper/lowercase
+  # Remove unwanted characters
+  x[grepl("^0", x)] <- "" # remove 0's
+  x <- gsub("[[:punct:]]", "", x) # remove special characters
+  # Remove prepending, trailing or excessive white spaces
+  x <- as.factor(str_trim(clean(x)))
+  x <- gsub(" ", "", x)
+  # reduce the length of the words to 5 letters
+  x <- as.factor(substr(x, 1, 5))
+  return(x)
+}
+
+## Clean data
+data$scheme_name <- clean_text(data$scheme_name)
+
+# As it is not possible to know if all the words follow the same logic (too many values), I'm just going to keep all of them lowercase.
+data$scheme_name <- as.factor(tolower(data$scheme_name))
+# plot(data[data$scheme_name != ""]$scheme_name)
+# levels(data$scheme_name)
+# it could make sense to keep this one because gives more detail on the 40k "VWC" we have on scheme_name.
+# Although, the data is not robust and a lot missings and unique values persist.
+# Therefore we're going to delete this column from the dataset.
+```
+
+### scheme_management
+```{r scheme_management}
+# Keeping all the words lowercase in order to ensure they follow the same pattern.
+data$scheme_management <- as.factor(tolower(data$scheme_management))
+
+## Clean data
+data$scheme_management <- clean_text(data$scheme_management)
+
+# impute missing as "None"
+# take off the level ""
+# plot(data[data$scheme_management != ""]$scheme_management)
+# levels(data$scheme_management)
+
+## 1st
+# Lets test if it is possible to give more detail on the "VWC" category in scheme_management
+vwc_sm <- as.data.frame(table(data[data$scheme_management == "vwc"]$scheme_name))
+vwc_sm[order(vwc_sm$Freq, decreasing = TRUE),]
+length(vwc_sm$Var1) # 1988 unique values, being one of them "" with 20000+ rows.
+# Imputing VWC with more detail from scheme_name is not possible, as there are 1873 different values and too many missings.
+
+## 2nd
+# Lets deal with the nulls.
+length(data[data$scheme_management == ""]$scheme_management)
+# Could we impute them with the values of scheme_name?
+as.data.frame(table(data[data$scheme_management == ""]$scheme_name))
+# No! Scheme_name does not help us, we still end up with 4483 null values.
+# We should try with management
+as.data.frame(table(data[data$scheme_management == ""]$management))
+# This would work. Although, we should not mix the 2 variables, has it could introduce bias. Maybe they'r not the same. [O/S - try it in the end to see if it improves the model]
+# Therefore, the best way is to impute the missings as none
+data$scheme_management[data$scheme_management == ""] <- "none"
+
+## 3rd
+# Lets drop the level ""
+data$scheme_management <- droplevels(data$scheme_management)
+levels(data$scheme_management)
+
+data <- data[,-c("scheme_name")]
+```
+
+### installer
+Note: to make this feature compatible with the random forest model we reduce the number of levels to 50 (the top 49 levels and a 50th "other" level)
+```{r installer}
+# 1st
+# We're going to clean the data in order to make it less granular
+data$installer <- clean_text(data$installer)
+
+# 2nd
+# Treat NA's and missing values
+# We have to add the level "none" to the levels in order to add him as an imputation to the missing values and NA's
+levels(data$installer) <- c(levels(data$installer), "none")
+data$installer[data$installer == ""] <- "none" # we're imputing none as we did not found a relation with other categorical variables that could help us encode this variable
+data$installer[is.na(data$installer)] <- "none"
+
+## 3rd
+# We tried to reduce the dimensionality of the data using a text matcher. Although the results did not match the expectations, as we were introducing some noise (from mismatches) into the data.
+
+# installer_df <- as.data.frame(table(data$installer))
+# installer_df <- installer_df[order(installer_df$Freq, decreasing = TRUE),]
+# vars <- as.character(head(installer_df$name1, 30))
+
+# match_words <- sapply(
+#  as.character(data$installer), 
+#  function(x){
+#    amatch(x,vars, method = 'osa', weight = c(d = 0.4, i = 1, s = 0.8, t = 0.7), maxDist = 3)
+#  }
+#)
+# data.frame(new = vars[match_words2],old = dt)
+# method = (delete, insert, substitute, transpose)
+
+# Therefore we are going to use a more simple approach for reducing the dimensionality, taking into consideration the frequency of the words and bining the less frequent in "others".
+
+installer_df <- as.data.frame(table(data$installer))
+installer_df <- installer_df[order(installer_df$Freq, decreasing = TRUE),]
+
+# Reducing for the top50 - random forest limit.
+varnottoremove <- head(installer_df$Var1, 49)
+data$installer[!data$installer %in% as.character(varnottoremove)] <- "other"
+
+## 4th
+# Lets drop the levels unused
+data$installer <- droplevels(data$installer)
+# levels(data$installer)
+```
+
+### funder
+Note: to make this feature compatible with the random forest model we reduce the number of levels to 50 (the top 49 levels and a 50th "other" level)
+```{r funder}
+# 1st
+# We're going to clean the data in order to make it less granular
+data$funder <- clean_text(data$funder)
+
+# 2nd
+# Treat NA's and missing values
+levels(data$funder) <- c(levels(data$funder), "none")
+data$funder[data$funder == ""] <- "none"
+
+## 3rd
+# We are going to use a simple approach for reducing the dimensionality of this variables, taking into consideration the frequency of the words and bining the less frequent in "others".
+
+funder_df <- as.data.frame(table(data$funder))
+funder_df <- funder_df[order(funder_df$Freq, decreasing = TRUE),]
+
+# Reducing for the top50 - random forest limit.
+varnottoremove <- head(funder_df$Var1, 49)
+data$funder[!data$funder %in% as.character(varnottoremove)] <- "other"
+
+## 4th
+# Dropping the levels not used
+data$funder <- droplevels(data$funder)
+levels(data$funder)
+
+af_funder_df <- as.data.frame(table(data$funder))
+af_funder_df <- af_funder_df[order(af_funder_df$Freq, decreasing = TRUE),]
+# sum(data$funder == "other") / length(data$funder) # new other category represents 25% of the data
+# sum(data$funder == "gover") / length(data$funder) # biggest category represents 15% of the data
+```
+
+### management
+
+```{r management}
+## 1st
+# We're going to clean the data in order to make it less granular
+levels(data$management) <- c(levels(data$management), "")
+data$management <- clean_text(data$management)
+
+# we have 683 unknowns. We're gonna leave it as it is in order to try and capture that effect. Additionally we are going to enconde it as none, so it can be aligned with the other variables.
+levels(data$management) <- c(levels(data$management), "none")
+data[data$management == "unkno"]$management <- "none"
+
+## 2nd
+# Dropping the levels not used
+data$management <- droplevels(data$management)
+#levels(data$management)
+
+```
+
+
+### management_group
+
+```{r management_group}
+# In this one we not going to clean the data using the function, as the data already is pretty clear and compact.
+
+# As we do not have any NA's or missing values, this feature will stay as it is
+# We could transform the "unknown" accordingly with other features. Although, by not deleting the other features we are already capturing that "detail", not being necessary any further transformation.
+data[data$management_group == "unknown"]$management_group <- "none"
+
+# Dropping the levels not used
+data$management_group <- droplevels(data$management_group)
+# levels(data$management_group)
+```
+
+###  permit & public_meeting
+We tried many visualizations to find trends in the missing values for permit and public_meeting and it turns out that they can be distinguished by geography!
+
+#### region
+Alright!  we are on to something, only certain regions have missing values for permit or public_meeting.  Let's zoom in on those
+
+```{r}
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+     
+Ok!  So in the case of regions, Dar es Salaam has no trues, so let's impute the missing as False since we can assume that that region doesn't do a permit thing.
+```{r}
+permit_region <- unique(data$region[data$permit==""])
+meeting_region <- unique(data$region[data$public_meeting==""])
+
+permit_region_data <- data[data$region%in%permit_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_region=region), .SDcols = "permit"]
+
+meeting_region_data <- data[data$region%in%meeting_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_region=region), .SDcols = "public_meeting"]
+
+permit_region_data[true==0 | false==0,]
+meeting_region_data[true==0 | false==0,]
+
+data$permit[data$region%in%permit_region_data[true==0 & false!=0,permit_region]] <- "False"
+```
+#### lga
+Now, let's repeat the process for lga (but we will leave the lga's with only missing values aside for now)
+```{r}
+permit_region <- unique(data$region[data$permit==""])
+meeting_region <- unique(data$region[data$public_meeting==""])
+
+ggplot(data=data[data$region %in% permit_region]) +
+  geom_bar(aes(x = lga, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data[data$region %in% meeting_region]) +
+  geom_bar(aes(x = lga, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+
+```{r}
+permit_lga <- unique(data$lga[data$permit==""])
+meeting_lga <- unique(data$lga[data$public_meeting ==""])
+
+permit_lga_data <- data[data$lga%in%permit_lga, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_lga=lga), .SDcols = "permit"]
+
+meeting_lga_data <- data[data$lga%in%meeting_lga, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_lga=lga), .SDcols = "public_meeting"]
+
+permit_lga_data[true==0 | false==0,]
+meeting_lga_data[true==0 | false==0,]
+
+data$permit[data$lga%in%permit_lga_data[true==0 & false!=0,permit_lga]] <- "False"
+data$permit[data$lga%in%permit_lga_data[true!=0 & false==0,permit_lga]] <- "True"
+
+data$public_meeting[data$lga%in%meeting_lga_data[true==0 & false!=0,meeting_lga]] <- "False"
+data$public_meeting[data$lga%in%meeting_lga_data[true!=0 & false==0,meeting_lga]] <- "True"
+```
+#### ward
+And now, to ward:
+```{r}
+permit_lga <- unique(data$lga[data$permit==""])
+meeting_lga <- unique(data$lga[data$public_meeting ==""])
+
+ggplot(data=data[data$lga %in% permit_lga]) +
+  geom_bar(aes(x = ward, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data[data$lga %in% meeting_lga]) +
+  geom_bar(aes(x = ward, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+
+```{r}
+permit_ward <- unique(data$ward[data$permit==""])
+meeting_ward <- unique(data$ward[data$public_meeting ==""])
+
+permit_ward_data <- data[data$ward%in%permit_ward, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_ward=ward), .SDcols = "permit"]
+
+meeting_ward_data <- data[data$ward%in%meeting_ward, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_ward=ward), .SDcols = "public_meeting"]
+
+permit_ward_data[true==0 | false==0,]
+meeting_ward_data[true==0 | false==0,]
+
+data$permit[data$ward%in%permit_ward_data[true==0 & false!=0,permit_ward]] <- "False"
+data$permit[data$ward%in%permit_ward_data[true!=0 & false==0,permit_ward]] <- "True"
+
+data$public_meeting[data$ward%in%meeting_ward_data[true==0 & false!=0,meeting_ward]] <- "False"
+data$public_meeting[data$ward%in%meeting_ward_data[true!=0 & false==0,meeting_ward]] <- "True"
+```
+
+#### round 2: region
+
+Let's go back to region and lga to see if any of the cateogries are cleared up
+```{r}
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+```{r}
+permit_region <- unique(data$region[data$permit==""])
+meeting_region <- unique(data$region[data$public_meeting==""])
+
+permit_region_data <- data[data$region%in%permit_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_region=region), .SDcols = "permit"]
+
+meeting_region_data <- data[data$region%in%meeting_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_region=region), .SDcols = "public_meeting"]
+
+permit_region_data[true==0 | false==0,]
+meeting_region_data[true==0 | false==0,]
+```
+
+#### round2: lga
+```{r}
+permit_region <- unique(data$region[data$permit==""])
+meeting_region <- unique(data$region[data$public_meeting==""])
+
+ggplot(data=data[data$region %in% permit_region]) +
+  geom_bar(aes(x = lga, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data[data$region %in% meeting_region]) +
+  geom_bar(aes(x = lga, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+```{r}
+permit_lga <- unique(data$lga[data$permit==""])
+meeting_lga <- unique(data$lga[data$public_meeting ==""])
+
+permit_lga_data <- data[data$lga%in%permit_lga, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_lga=lga), .SDcols = "permit"]
+
+meeting_lga_data <- data[data$lga%in%meeting_lga, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_lga=lga), .SDcols = "public_meeting"]
+
+permit_lga_data[true==0 | false==0,]
+meeting_lga_data[true==0 | false==0,]
+
+data$permit[data$lga%in%permit_lga_data[true==0 & false!=0,permit_lga]] <- "False"
+data$permit[data$lga%in%permit_lga_data[true!=0 & false==0,permit_lga]] <- "True"
+
+# since there are none we won't need this code:
+# data$public_meeting[data$lga%in%meeting_lga_data[true==0 & false!=0,meeting_lga]] <- "False"
+# data$public_meeting[data$lga%in%meeting_lga_data[true!=0 & false==0,meeting_lga]] <- "True"
+```
+
+#### round2: ward
+```{r}
+permit_lga <- unique(data$lga[data$permit==""])
+meeting_lga <- unique(data$lga[data$public_meeting ==""])
+
+ggplot(data=data[data$lga %in% permit_lga]) +
+  geom_bar(aes(x = ward, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data[data$lga %in% meeting_lga]) +
+  geom_bar(aes(x = ward, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+```{r}
+permit_ward <- unique(data$ward[data$permit==""])
+meeting_ward <- unique(data$ward[data$public_meeting ==""])
+
+permit_ward_data <- data[data$ward%in%permit_ward, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_ward=ward), .SDcols = "permit"]
+
+meeting_ward_data <- data[data$ward%in%meeting_ward, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_ward=ward), .SDcols = "public_meeting"]
+
+permit_ward_data[true==0 | false==0,]
+meeting_ward_data[true==0 | false==0,]
+
+data$permit[data$ward%in%permit_ward_data[true==0 & false!=0,permit_ward]] <- "False"
+data$permit[data$ward%in%permit_ward_data[true!=0 & false==0,permit_ward]] <- "True"
+
+data$public_meeting[data$ward%in%meeting_ward_data[true==0 & false!=0,meeting_ward]] <- "False"
+data$public_meeting[data$ward%in%meeting_ward_data[true!=0 & false==0,meeting_ward]] <- "True"
+```
+
+#### round3: 
+```{r}
+permit_region <- unique(data$region[data$permit==""])
+meeting_region <- unique(data$region[data$public_meeting==""])
+
+permit_region_data <- data[data$region%in%permit_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_region=region), .SDcols = "permit"]
+
+meeting_region_data <- data[data$region%in%meeting_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_region=region), .SDcols = "public_meeting"]
+
+permit_region_data[true==0 | false==0,]
+meeting_region_data[true==0 | false==0,]
+```
+```{r}
+permit_lga <- unique(data$lga[data$permit==""])
+meeting_lga <- unique(data$lga[data$public_meeting ==""])
+
+permit_lga_data <- data[data$lga%in%permit_lga, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_lga=lga), .SDcols = "permit"]
+
+meeting_lga_data <- data[data$lga%in%meeting_lga, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_lga=lga), .SDcols = "public_meeting"]
+
+permit_lga_data[true==0 | false==0,]
+meeting_lga_data[true==0 | false==0,]
+
+data$permit[data$lga%in%permit_lga_data[true==0 & false!=0,permit_lga]] <- "False"
+data$permit[data$lga%in%permit_lga_data[true!=0 & false==0,permit_lga]] <- "True"
+
+# since there are none we won't need this code
+# data$public_meeting[data$lga%in%meeting_lga_data[true==0 & false!=0,meeting_lga]] <- "False"
+# data$public_meeting[data$lga%in%meeting_lga_data[true!=0 & false==0,meeting_lga]] <- "True"
+```
+```{r}
+permit_ward <- unique(data$ward[data$permit==""])
+meeting_ward <- unique(data$ward[data$public_meeting ==""])
+
+permit_ward_data <- data[data$ward%in%permit_ward, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_ward=ward), .SDcols = "permit"]
+
+meeting_ward_data <- data[data$ward%in%meeting_ward, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_ward=ward), .SDcols = "public_meeting"]
+
+permit_ward_data[true==0 | false==0,]
+meeting_ward_data[true==0 | false==0,]
+
+# since there are none we won't need this code:
+# data$permit[data$ward%in%permit_ward_data[true==0 & false!=0,permit_ward]] <- "False"
+# data$permit[data$ward%in%permit_ward_data[true!=0 & false==0,permit_ward]] <- "True"
+#
+# data$public_meeting[data$ward%in%meeting_ward_data[true==0 & false!=0,meeting_ward]] <- "False"
+# data$public_meeting[data$ward%in%meeting_ward_data[true!=0 & false==0,meeting_ward]] <- "True"
+```
+
+#### remainders
+With the remainders impute the missing values as the most common value (true or false) in each region
+```{r}
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+
+```{r}
+permit_region <- unique(data$region[data$permit==""])
+meeting_region <- unique(data$region[data$public_meeting==""])
+
+permit_region_data <- data[data$region%in%permit_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(permit_region=region), .SDcols = "permit"]
+
+meeting_region_data <- data[data$region%in%meeting_region, c(list(miss=lapply(.SD, function(x){sum(x=="")}), true=lapply(.SD, function(x){sum(x=="True")}), false = lapply(.SD, function(x){sum(x=="False")}))), by = list(meeting_region=region), .SDcols = "public_meeting"]
+
+data$permit[data$region%in%permit_region_data[as.numeric(true)>as.numeric(false),permit_region]&data$permit==""] <- "True"
+
+data$permit[data$region%in%permit_region_data[as.numeric(false)>as.numeric(true),permit_region]&data$permit==""] <- "False"
+
+data$public_meeting[data$region%in%meeting_region_data[as.numeric(true)>as.numeric(false),meeting_region]&data$public_meeting==""] <- "True"
+
+data$public_meeting[data$region%in%meeting_region_data[as.numeric(false)>as.numeric(true),meeting_region]&data$public_meeting==""] <- "False"
+```
+     
+Here is a final check to make sure all the values were imputed correctly: 
+```{r}
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = permit)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+
+ggplot(data=data) +
+  geom_bar(aes(x = region, fill = public_meeting)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+
+## construction_year
+Here is a good way we can impute the zeros:
+First, let's try grouping the nonzero construction year values by different features and looking at a cummulative distribution plot.  Since the data is sorted by standard deviation, we can look at the area under the curve and choose the combiniation of features which gives us the highest value.
+```{r}
+data$construction_year <- as.numeric(as.character(data$construction_year))
+
+#-------------------ward is too granular (region is bad too)
+test_year3<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(year_asDate, ward), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom3<-test_year3[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data3<- data.table(index=row.names(zoom3), count_year = as.numeric(zoom3$count_year))
+
+#-------------------OMG AMAZING (0.75 pre 20000)
+test_year5<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(year_asDate, extraction_type, scheme_management), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom5<-test_year5[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data5<- data.table(index=row.names(zoom5), count_year = as.numeric(zoom5$count_year))
+
+#-------------------group is slightly better than type
+test_year7<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(quarter_asDate, extraction_type_group, scheme_management), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom7<-test_year7[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data7<- data.table(index=row.names(zoom7), count_year = as.numeric(zoom7$count_year))
+
+#-------------------
+ggplot(data=zoom_plot_data3)+  stat_ecdf(aes(cumsum(count_year)))
+
+ggplot(data=zoom_plot_data5)+  stat_ecdf(aes(cumsum(count_year)))
+
+ggplot(data=zoom_plot_data7)+  stat_ecdf(aes(cumsum(count_year)))
+```
+     
+We see that quarter_asDate, extraction_type_group, and scheme_management are the best combination, so now we impute the zero construction years using the median year value from this grouping. 
+```{r}
+c_year_group <- data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(quarter_asDate, extraction_type_group, scheme_management), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+for (i in 1:nrow(c_year_group)){
+  quarter <- c_year_group[i, quarter_asDate]
+  extraction <- c_year_group[i, extraction_type_group]
+  scheme <- c_year_group[i, scheme_management]
+  
+  data[construction_year==0 & quarter_asDate==quarter & extraction_type_group==extraction & scheme_management==scheme, "construction_year"] <- as.integer(c_year_group[i,med_year])
+}
+
+sum(data$construction_year==0)
+```
+
+But, there are still some zeros which didn't match any of the combinations, so let's find the greatest area under the curve using one less feature.
+```{r}
+#--------------------------Use this
+test_year7_1<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(quarter_asDate, extraction_type_group), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom7_1<-test_year7_1[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data7_1<- data.table(index=row.names(zoom7_1), count_year = as.numeric(zoom7_1$count_year))
+
+ggplot(data=zoom_plot_data7_1)+  stat_ecdf(aes(cumsum(count_year)))
+
+#--------------------------
+
+test_year7_2<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(quarter_asDate, scheme_management), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom7_2<-test_year7_2[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data7_2<- data.table(index=row.names(zoom7_2), count_year = as.numeric(zoom7_2$count_year))
+
+ggplot(data=zoom_plot_data7_2)+  stat_ecdf(aes(cumsum(count_year)))
+
+#--------------------------
+
+test_year7_3<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(extraction_type_group, scheme_management), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom7_3<-test_year7_3[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data7_3<- data.table(index=row.names(zoom7_3), count_year = as.numeric(zoom7_3$count_year))
+
+ggplot(data=zoom_plot_data7_3)+  stat_ecdf(aes(cumsum(count_year)))
+```
+     
+The best combination was quarter_asDate and extraction_type_group, so we will repeate the above process to impute more zeros.
+```{r}
+c_year_group2<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(quarter_asDate, extraction_type_group), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+for (i in 1:nrow(c_year_group2)){
+  quarter <- c_year_group2[i, quarter_asDate]
+  extraction <- c_year_group2[i, extraction_type_group]
+  
+  data[construction_year==0 & quarter_asDate==quarter & extraction_type_group==extraction, "construction_year"] <- as.integer(c_year_group2[i,med_year])
+}
+
+sum(data$construction_year==0)
+```
+
+To deal with the few remainging zeros let's check to see if quarter or extraction_type_group give a better area under the curve.
+```{r}
+test_year7_1_1<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(quarter_asDate), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom7_1_1<-test_year7_1_1[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data7_1_1<- data.table(index=row.names(zoom7_1_1), count_year = as.numeric(zoom7_1_1$count_year))
+
+ggplot(data=zoom_plot_data7_1_1)+  stat_ecdf(aes(cumsum(count_year)))
+
+#------------------------------ use this
+test_year7_1_2<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(extraction_type_group), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+zoom7_1_2<-test_year7_1_2[sd_year!="0" & !is.na(sd_year),][order(as.numeric(sd_year))]
+
+zoom_plot_data7_1_2<- data.table(index=row.names(zoom7_1_2), count_year = as.numeric(zoom7_1_2$count_year))
+
+ggplot(data=zoom_plot_data7_1_2)+  stat_ecdf(aes(cumsum(count_year)))
+
+```
+     
+Since extraction type was the best, we use it to impute the remaining zero construction years.  
+```{r}
+c_year_group3<-data[data$construction_year!=0, list(med_year=lapply(.SD, median),sd_year =lapply(.SD,sd), count_year=.N), by = list(extraction_type_group), .SDcols= "construction_year"][order(as.numeric(sd_year))]
+
+for (i in 1:nrow(c_year_group3)){
+  extraction <- c_year_group3[i, extraction_type_group]
+  
+  data[construction_year==0 & extraction_type_group==extraction, "construction_year"] <- as.integer(c_year_group3[i,med_year])
+}
+
+sum(data$construction_year==0)
+```
+     
+Note: with each level of imputation we included the previously imputed years to calculate the new median value.  This was to have a more accurate approximation even though we are adding more potential estimation error.  
+     
+Let's see the proportion of functionality over the years again:
+```{r}
+# comparing proportion of functionalities accross years
+
+construct_data <- data[data$status_group!="unkown", c(list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")}), prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")}), prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")}))), by = construction_year, .SDcols="status_group"][order(construction_year, decreasing = FALSE)]
+
+construct_data$prop_fun <- as.numeric(construct_data$prop_fun)
+construct_data$prop_repair <- as.numeric(construct_data$prop_repair)
+construct_data$prop_nofun <- as.numeric(construct_data$prop_nofun)
+
+
+ggplot(data = construct_data)+
+  geom_point(aes(x = construction_year, y = prop_fun, color = 'prop_fun'))+
+  geom_point(aes(x = construction_year, y = prop_repair, color = "prop_repair"))+
+  geom_point(aes(x = construction_year, y = prop_nofun, color = "prop_nofun"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "proportion") +
+  scale_color_discrete(name = "status_group")+
+  scale_color_manual(values=c("green", "red", "yellow"))+
+  geom_hline(yintercept = 1, linetype="dashed")
+```
+     
+We notice a slight change in the plot, but the main trends are the same.
+
+## population
+To impute the zeros we will use the 2002 population density statistics taken from (http://ccs.ukzn.ac.za/files/madulu.pdf) to weight the average known population in each region.  
+```{r}
+# regions and densities
+region_density <- data.table("region"=unique(data$region), "density"=c(26.2, 69.7, 22.6, 67.3, 71.4, 61.0, 55.1, 22.5, 27.3, 17.5, 103.4, 16.6, 149.5, 45.2, 11.9, 41.0, 35.3, 34.2, 22.0, 24.8, 1785.6))
+
+# regions, extraction type class, and average known population
+data_by_region_type <- data[data$population!=0, list(med_pop=lapply(.SD,median)), by = list(region, extraction_type_class), .SDcols = "population"]
+
+# merge with densities
+data_by_region_type <- merge(data_by_region_type, region_density, by = "region")
+
+# regions and average known population
+data_by_region <- data[data$population!=0, list(med_pop=lapply(.SD,median)), by = list(region), .SDcols = "population"]
+
+# merge with densities
+data_by_region <- merge(data_by_region, region_density, by="region")
+```
+
+     
+There are clearly some regions with all population values recorded as zero and some regions where only some population values are recorded as zero.  
+```{r}
+ggplot(data = data)+
+  geom_bar(aes(x=region, fill = data$population==0)) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+     
+For the zero populations within these regions and type classes we will impute using the pop_by_region_type average values:
+```{r}
+for (i in 1:nrow(data_by_region_type)){
+  region_ <- data_by_region_type[i, region]
+  type_class <- data_by_region_type[i, extraction_type_class]
+
+  data[ population==0 & region==region_ & extraction_type_class==type_class, "population"] <- as.integer(data_by_region_type[i,med_pop])
+}
+```
+     
+Now, we see som of the regions were fixed, but some still have all the region with no population value, and some extraction types were not listed for the known populations within a region.
+```{r}
+ggplot(data = data)+
+  geom_bar(aes(x=region, fill = data$population==0 )) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+     
+Now we will introduce the densities and impute the missing values with a weighted average based on the densities
+
+```{r}
+# weighted average by extraction type
+weighted_avg_type <- data_by_region_type[,list(avg =mean(as.numeric(med_pop)/density)), by = extraction_type_class]
+weighted_avg_type <- merge(data_by_region_type, weighted_avg_type, by = "extraction_type_class")
+
+# weighted average over all extraction types
+weighted_avg_general <- mean(as.numeric(data_by_region$med_pop)/data_by_region$density)
+```
+     
+Impute based on weighted average per each extraction_type_class multiplied by the region's density.
+```{r}
+zero_pop_data <-data[population==0, list(population=sum(population)), by = list(region, extraction_type_class)]
+
+for (i in 1:nrow(zero_pop_data)){
+  type_class <- zero_pop_data[i, extraction_type_class]
+  region_ <- zero_pop_data[i, region]
+
+  impute_pop <- as.integer(weighted_avg_type[extraction_type_class==type_class, avg]*region_density[region==region_, density])
+
+  if (length(impute_pop)>0){
+  data[(population==0) & region==region_ & extraction_type_class==type_class, "population"] <- impute_pop
+  }
+}
+
+ggplot(data = data)+
+  geom_bar(aes(x=region, fill = data$population==0)) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0))
+```
+### plots with imputed population
+
+Let's look at the time graph again
+```{r}
+pop_bin <- cut(data$population, breaks = c(seq(1, 1550, 50), max(data$population)), include.lowest = TRUE)
+
+# add pop_bin to the dataset
+data <- cbind(data,pop_bin)
+
+pop_data <- data[data$status_group!="unkown", c(list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")}), prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")}), prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")}))), by = pop_bin, .SDcols="status_group"][order(pop_bin, decreasing = FALSE)]
+
+
+pop_data$prop_fun <- as.numeric(pop_data$prop_fun)
+pop_data$prop_repair <- as.numeric(pop_data$prop_repair)
+pop_data$prop_nofun <- as.numeric(pop_data$prop_nofun)
+pop_bin_num <- as.numeric(pop_data$pop_bin)
+pop_data <- cbind(pop_data, pop_bin_num)
+
+
+ggplot(data = pop_data)+
+  geom_point(aes(x = pop_bin_num, y = prop_fun, color = 'prop_fun'))+
+  geom_point(aes(x = pop_bin_num, y = prop_repair, color = "prop_repair"))+
+  geom_point(aes(x = pop_bin_num, y = prop_nofun, color = "prop_nofun"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "proportion") +
+  scale_color_discrete(name = "status_group")+
+  scale_color_manual(values=c("green", "red", "yellow"))+
+  geom_hline(yintercept = 1, linetype="dashed")+
+  scale_x_continuous(labels= pop_data$pop_bin, breaks = pop_data$pop_bin_num)
+
+# drop pop_bin since we don't need it anymore
+data <- data[,-("pop_bin")]
+```
+
+### outliers?
+First we explore some trends with potential population outliers
+```{r}
+# population and status group
+
+ggplot(data=data[data$status_group != "unknown" &  data$population < 1500]) +
+  facet_wrap(~status_group, ncol = 1) +
+  geom_histogram(aes(x = population), binwidth = 50 ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population[1:1500]")
+
+ggplot(data=data[data$status_group != "unknown" &  data$population < 50]) +
+  facet_wrap(~status_group, ncol = 1) +
+  geom_histogram(aes(x = population), binwidth = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population[1:50]")
+
+pop_wayout <- data$population
+pop_wayout[pop_wayout<=1500] <- 0
+pop_wayout[pop_wayout>1500] <- 1
+
+data <- cbind(data,pop_wayout)
+
+ggplot(data=data[data$status_group != "unknown" & data$pop_wayout==1])+
+  geom_bar(aes(x = pop_wayout, fill = status_group) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = high outlier")
+
+ggplot(data=data[data$status_group != "unknown" & data$population<=1500])+
+  geom_violin(aes(x = status_group, y = population) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = high outlier")
+
+ggplot(data=data[data$status_group != "unknown" & data$population>1500])+
+  geom_violin(aes(x = status_group, y = population) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = high outlier")
+
+ggplot(data=data[data$status_group != "unknown" & data$population>10000])+
+  geom_violin(aes(x = status_group, y = population) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = high outlier")
+
+ggplot(data=data[data$status_group != "unknown" & data$pop_wayout==0])+
+  geom_bar(aes(x = pop_wayout, fill = status_group) ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0)) +
+  labs(title = "population = normal")
+
+
+data <- data[,-("pop_wayout")]
+```
+
+Then, we'll consider creating a version of binned population to deal with the outliers in population.  The binning cutoffs were determined based on the violin plots seen above, where 1500-5000 is mostly uniform, 5000-10000 is slightly skewed towards needs repair, 10000-20000 is highly skewed towards needs repair, and 20000+ is skewed towards functional.  Simlarly we bin the regular values from 1-1500
+```{r}
+# binning did not improve the model so we won't use this code:
+
+# binned_population <- cut(data$population, breaks = c(1,125,375,500,750,1000,1500,5000,10000,20000, max(data$population)), include.lowest = TRUE)
+
+#data <- cbind(data, binned_population)
+```
+In the end, we tried binning the population as well as imputing the outliers (using the same technique as the zero values), but no outlier method was able to improve the model.  Clearly, the random forest model was able to most accurately "bin" the values in the tree branches.
+
+## amount_tsh
+
+Using a similar strategy we can impute the amount_tsh zeros.  The commented code are the groupings that did not work as nicely:
+```{r}
+# find the median amount_tsh for each extraction_type_group
+extract_tsh <- data[data$amount_tsh !=0, lapply(.SD, median), by=c("extraction_type_group"), .SDcols=c("amount_tsh")][order(extraction_type_group)]
+
+extract_impute <- arrange(extract_tsh, desc(amount_tsh))
+
+# find the median amount_tsh for each waterpoint_type_group
+waterpoint_tsh <- data[data$amount_tsh !=0, lapply(.SD, median), by=c("waterpoint_type_group"), .SDcols=c("amount_tsh")][order(waterpoint_type_group)]
+
+waterpoint_impute <- arrange(waterpoint_tsh, desc(amount_tsh))
+
+
+# find the median amount_tsh based on:
+# extraction_type_group, waterpoint_type_group, source-type, and basin
+# ewsb_tsh <- data[data$amount_tsh !=0, lapply(.SD, median), by=c("extraction_type_group", "waterpoint_type_group", "source_type", "basin"), .SDcols=c("amount_tsh")]
+
+# ewsb_impute <- arrange(ewsb_tsh, desc(amount_tsh))
+
+
+# find the median amount_tsh based on:
+# waterpoint_type_group, source_class, basin
+# wsb_tsh <- data[data$amount_tsh !=0, lapply(.SD, median), by=c("waterpoint_type_group", "source_class", "basin"), .SDcols=c("amount_tsh")]
+
+# wsb_impute <- arrange(wsb_tsh, desc(amount_tsh))
+
+
+# find the median amount_tsh based on:
+# extraction_type_group, waterpoint_type_group, source_type
+ews_tsh <- data[data$amount_tsh !=0, lapply(.SD, median), by=c("extraction_type_group", "waterpoint_type_group", "source_type"), .SDcols=c("amount_tsh")]
+
+ews_impute <- arrange(ews_tsh, desc(amount_tsh))
+```
+     
+Here we do the imputation:
+``` {r}
+# Option 1:
+# impute using extraction_type_group, waterpoint_type_group, and source_type, and basin
+# for (i in 1:nrow(ewsb_impute)) {
+#   data[amount_tsh == 0 & extraction_type_group == as.character(ewsb_impute[i,1]) & waterpoint_type_group == as.character(ewsb_impute[i,2]) & source_type == as.character(ewsb_impute[i,3]) & basin == as.character(ewsb_impute[i,4]), "amount_tsh"] <- ewsb_impute[i,5]
+# }
+
+# Option 2:
+# impute using waterpoint_type_group, source_class, basin
+# for (i in 1:nrow(wsb_impute)) {
+#   data[amount_tsh == 0 & waterpoint_type_group == as.character(wsb_impute[i,1]) & source_class == as.character(wsb_impute[i,2]) & basin == as.character(wsb_impute[i,3]), "amount_tsh"] <- wsb_impute[i,4]
+# }
+
+
+# Option 3:
+# impute using extraction_type_group, waterpoint_type_group, source_type
+for (i in 1:nrow(ews_impute)) {
+  data[amount_tsh == 0 & extraction_type_group == as.character(ews_impute[i,1]) & waterpoint_type_group == as.character(ews_impute[i,2]) & source_type == as.character(ews_impute[i,3]), "amount_tsh"] <- ews_impute[i,4]
+}
+
+# if there is no median for the combination of these factors, then use waterpoint to impute
+for (i in 1:nrow(waterpoint_impute)) {
+data[amount_tsh == 0 & waterpoint_type_group == as.character(waterpoint_impute[i,1]), "amount_tsh"] <- waterpoint_impute[i,2]
+}
+
+# check that all zero values are gone
+# View(ewsb_impute)
+# View(data[,c("amount_tsh","extraction_type_group","waterpoint_type_group","source_type","basin")])
+table(data$amount_tsh)
+```
+# Feature Creation
+
+## date_recorded
+Testing the model, keeping the year, quarter, month, and week features we added earlier improves the baseline.  
+
+## create age_construct2013
+We create the age since construction by subtracting the construction_year from the max construction_year.  Then we add age_construct2013 to the dataset and remove construction year
+```{r}
+age_construct2013 <- max(data$construction_year) - data$construction_year
+
+data <- cbind(data, age_construct2013)
+
+data <- data[,-c("construction_year")]
+```
+
+## create age_recorded
+In the end, this feature was not used (the model performed better with age_construct2013)
+```{r}
+# age_recorded <- as.numeric(as.character(data$year_asDate)) - as.numeric(as.character(data$construction_year))
+# 
+# age_recorded[age_recorded<0 & data$construction_year==2005] <- median(age_recorded[data$construction_year==2005])
+# 
+# age_recorded[age_recorded<0 & data$construction_year==2006] <- median(age_recorded[data$construction_year==2006])
+# 
+# age_recorded[age_recorded<0 & data$construction_year==2007] <- median(age_recorded[data$construction_year==2007])
+# 
+# age_recorded[age_recorded<0 & data$construction_year==2008] <- median(age_recorded[data$construction_year==2008])
+# 
+# age_recorded[age_recorded<0 & data$construction_year==2009] <- median(age_recorded[data$construction_year==2009])
+# 
+# age_recorded[age_recorded<0 & data$construction_year==2011] <- median(age_recorded[data$construction_year==2011])
+# 
+# #data <- cbind(data, age_recorded)
+```
+
+```{r}
+# # let's see how the age_recorded variable looks in the time graph that we did with construction_year
+# age_data <- data[data$status_group!="unkown", c(list(prop_fun =lapply(.SD, function(x){sum(x=="functional")/sum(x!="functional")}), prop_repair =lapply(.SD, function(x){sum(x=="functional needs repair")/sum(x!="functional needs repair")}), prop_nofun =lapply(.SD, function(x){sum(x=="non functional")/sum(x!="non functional")}))), by = age_recorded, .SDcols="status_group"][order(age_recorded, decreasing = FALSE)]
+# 
+# age_data$prop_fun <- as.numeric(age_data$prop_fun)
+# age_data$prop_repair <- as.numeric(age_data$prop_repair)
+# age_data$prop_nofun <- as.numeric(age_data$prop_nofun)
+# 
+# ggplot(data = age_data)+
+#   geom_point(aes(x = age_recorded, y = prop_fun, color = 'prop_fun'))+
+#   geom_point(aes(x = age_recorded, y = prop_repair, color = "prop_repair"))+
+#   geom_point(aes(x = age_recorded, y = prop_nofun, color = "prop_nofun"))+
+#   theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+#   labs(y = "proportion") +
+#   scale_color_discrete(name = "status_group")+
+#   scale_color_manual(values=c("green", "red", "yellow"))+
+#   geom_hline(yintercept = 1, linetype="dashed")+
+#   geom_vline(xintercept = c(14,32)) +
+#   scale_x_reverse()
+```
+
+## Normal Distance / Lat / Long
+This csv was the output of python code (see Python notebook)
+First we add the new normal distance feature (pump distance from the center of each geographic ward)
+```{r}
+norm_dist_dt <- data.table(read.csv("data/normalized_dist_output.csv"))
+
+normal_distance <- norm_dist_dt$normal_distance
+data <- cbind(data, normal_distance)
+
+data$latitude <- norm_dist_dt$latitude
+data$longitude <- norm_dist_dt$longitude
+```
+
+### District Code & Region Code
+Then we make district_code a factor variable and drop region_code since it is a repeat (with mistakes) of region (see python notebook)
+```{r}
+data$district_code <- factor(norm_dist_dt$district_code)
+
+data <- data[,-("region_code")]
+```
+     
+Note: in terms of other features, we decided to drop waterpoint_name, ward, lga, and sub_village because they were too detailed and did not improve the model.  These features are dropped at the beginning of the section called Random Forest Model, by filtering through features with more than 50 levels.  
+
+# Train/Test Split
+Now we can split the data to the train and test sets again:
+```{r}
+train_data <- data[1:59400,]
+train_data$status_group <- droplevels(train_data$status_group) # if we don't do this it keeps the "unknown" from before
+
+test_data <- data[59401:74250,-"status_group"] 
+```
+
+
+# Random Forest Model
+
+Some of our features have too many levels to be accounted for in the random forest model, so we remove them here.
+```{r}
+too_many_levels <- names(train_data)[sapply(train_data, function(x){length(levels(x))})>50]
+train_data <- train_data[,!(..too_many_levels)]
+```
+     
+First, we do some parameter optimization on the mtry parameter.  Note: since there is a class imbalance we use the "Kappa" metric to find the best parameters.  In the end, the optimal mtry was the default sqrt(mtry).
+```{r}
+# here we do a parameter opitimization to get the best model parameters
+# rf_control <- trainControl(
+#   method="repeatedcv",
+#   number = 5,
+#   repeats = 3,
+#   search = "grid"
+# )
+# 
+# param_grid <- expand.grid(
+#   .mtry = c(1:30)
+# )
+# 
+# 
+# set.seed(42)
+# rf_model_tuned <- train(status_group~., data=train_data, trControl=rf_control, tuneGrid=param_grid, method="rf", metric = "Kappa")
+
+# rf_model_tuned$bestTune
+```
+     
+Now we can train the random forest model.
+```{r}
+# train the random forest model
+set.seed(42)
+rf_model <- randomForest(status_group~., data=train_data, importance=TRUE, ntree = 500, na.action = na.exclude)
+```
+
+
+```{r}
+# get the mse of the model and variable importance
+rf_model$confusion
+importance(rf_model)
+varImpPlot(rf_model)
+```
+
+
+```{r}
+# get the predicted values
+rf_pred <- predict(rf_model, newdata=test_data)
+
+# generate submission
+submission <- data.table(test[,"id"], status_group = rf_pred)
+write.csv(submission, file = "submission.csv", row.names = FALSE)
+```
+
+# Other Models
+
+## SVM
+For the SVM models, we explored using two different R packages, e1071 and kernlab (caret).
+
+The primary limitation for SVM was computation time, which is to be expected b ased on the number of features/observations. SVM takes longer to run in comparison with other models we have used e.g. decision trees or random forest.
+
+In order to circumvent the computation time issue, we took random samples of the full data set (either 1,000 or 10,000 rows), then split into a training and validation data set to fit the model.
+
+The results show that, using the SVM model with default parameters, kernlab apparently outperforms e1071. For a sample of 10,000 rows, kernlab resulted in an accuracy of 0.7493333 vs. e1071 with an accuracy of 0.638.
+
+In addition, we found that using a different type parameter, specifically one designed for multi-class classification ("spoc-svc", or Crammer/Singer native multi-class) resulted in improved performance over the default type parameter. For the 1,000 sample case, it improved the kernlab SVM model from 0.70 to 0.73 accuracy on the validation set.
+
+Nonetheless, since both versions of the SVM model result in a lower score than Random Forest and other models, we have decided not to use SVM for final results submission.
+
+``` {r}
+# Take a subset of the dataset to reduce computation time
+
+# Some features have too many levels for modeling, so we remove them here.
+# too_many_levels <- names(train_data)[sapply(train_data, function(x){length(levels(x))})>50]
+# train_data <- train_data[,!(..too_many_levels)]
+
+# Set seed
+set.seed(42)
+
+# Take a subset of the data because SVM takes too long to train on the full dataset
+# train_subset <- train_data
+train_subset <- train_data[1:1000,]
+
+# Separate into train and validation classes
+index_train <- sample(1:nrow(train_subset), 0.7*nrow(train_subset));
+train_class <- train_subset[index_train,]
+valid_class <- train_subset[-index_train,]
+
+```
+
+``` {r}
+# Create a function to calculate accuracy
+svm_accuracy <- function(prediction, real) {
+  ret <- 100*sum(prediction == real)/length(real);
+  return(ret);
+}
+
+# Create a function to calculate prediction results
+svm_wrapper <- function(model, dataset, target, metric_f){
+  
+  # 1) Get model predictions
+  predictions <- predict(model, newdata = dataset);
+  
+  # 2) Compute Metrics
+  metric <- metric_f(predictions, target);
+  
+  return(metric);
+}
+
+```
+
+# Version 1: SVM model using e1071
+
+``` {r}
+
+# Train the SVM model (using "e1071")
+svm_e1071 <- svm(status_group ~ amount_tsh + 
+                    date_recorded +
+                    funder + 
+                    gps_height +
+                    installer +
+                    longitude +
+                    latitude +
+                    basin +
+                    region +
+                    district_code +
+                    lga +
+                    ward +
+                    population +
+                    public_meeting +
+                    scheme_management +
+                    permit +
+                    extraction_type +
+                    extraction_type_group +
+                    extraction_type_class +
+                    management +
+                    management_group +
+                    payment_type +
+                    quality_group +
+                    quantity +
+                    source_type +
+                    source_class +
+                    waterpoint_type +
+                    waterpoint_type_group +
+                    year_asDate +
+                    month_asDate +
+                    quarter_asDate +
+                    week_asDate +
+                    age_construct2013 +
+                    normal_distance,
+                    data=train_class,
+                    kernel="radial")
+
+# simpler model
+# svm_e1071 <- svm(status_group ~ amount_tsh + age_construct2013, data=train_class)
+
+# SKIPPED VARIABLES:
+# wpt_name --> Error: cannot allocate vector of size 15.5 Gb
+# num_private --> Variable(s) `' constant. Cannot scale data.
+
+# SLOW VARIABLES:
+# subvillage
+
+# DELETED VARIABLES:
+# water_quality
+# quantity_group
+# recorded_by
+# region_code
+# scheme_name
+# construction_year
+# payment
+# source
+
+svm_e1071
+
+```
+
+
+``` {r}
+
+# Compute the SVM results
+
+# e1071_results_train <- svm_wrapper(svm_e1071, train_class, train_class$status_group, svm_accuracy)
+# e1071_results_valid <- svm_wrapper(svm_e1071, valid_class, valid_class$status_group, svm_accuracy)
+# e1071_results_train
+# e1071_results_valid
+
+# Display the confusion matrix
+
+# e1071_predictions <- predict(svm_e1071, newdata = valid_class)
+# e1071_table <- table(e1071_predictions,valid_class$status_group)
+# e1071_table
+
+```
+
+```{r}
+# Calculate the accuracy for SVM e1071 model
+# e1071_accuracy <- (e1071_table[1,1]+e1071_table[2,2]+e1071_table[3,3])/sum(e1071_table[,1:3])
+# print(e1071_accuracy)
+
+```
+
+``` {r}
+# Using a model with only numerical variables, we can also visualize what the SVM boundaries might look like in a simple case:
+svm_visual <- svm(status_group ~ amount_tsh + age_construct2013 + normal_distance + population, data=train_class)
+filtered <- valid_class[,c('amount_tsh','age_construct2013', 'normal_distance', 'population', 'status_group')]
+
+# Plot the SVM boundaries using two numerical variables
+plot(svm_visual, filtered, age_construct2013 ~ population)
+
+# plot(svm_visual, filtered,  amount_tsh ~ normal_distance)
+
+```
+
+``` {r}
+# Tune the SVM model parameters (for e1071)
+
+# e1071_tune <- tune(svm_e1071, status_group~., data = train_class, kernel="radial", ranges=list(cost=10^(-1:2), gamma=c(.5,1,2)))
+
+# print(e1071_tune)
+
+```
+
+
+# Version 2: SVM model using Kernlab
+
+```{r}
+
+svm_kern <- ksvm(status_group ~ amount_tsh + 
+                    date_recorded +
+                    funder + 
+                    gps_height +
+                    installer +
+                    longitude +
+                    latitude +
+                    basin +
+                    region +
+                    district_code +
+                    lga +
+                    ward +
+                    population +
+                    public_meeting +
+                    scheme_management +
+                    permit +
+                    extraction_type +
+                    extraction_type_group +
+                    extraction_type_class +
+                    management +
+                    management_group +
+                    payment_type +
+                    quality_group +
+                    quantity +
+                    source_type +
+                    source_class +
+                    waterpoint_type +
+                    waterpoint_type_group +
+                    year_asDate +
+                    month_asDate +
+                    quarter_asDate +
+                    week_asDate +
+                    age_construct2013 +
+                    normal_distance,
+                    data=train_class,
+                    type='spoc-svc',
+                    kernel='rbfdot',
+                    C=1)
+
+# simpler model
+# svm_kern <- ksvm(status_group ~ amount_tsh + age_construct2013, data=train_class)
+
+svm_kern
+
+```
+
+
+``` {r}
+
+# Compute the SVM results
+
+# kern_results_train <- svm_wrapper(svm_kern, train_class, train_class$status_group, svm_accuracy)
+# kern_results_valid <- svm_wrapper(svm_kern, valid_class, valid_class$status_group, svm_accuracy)
+# kern_results_train
+# kern_results_valid
+
+# Display the confusion matrix
+
+kern_predictions <- predict(svm_kern, newdata = valid_class)
+kern_table <- table(kern_predictions,valid_class$status_group)
+kern_table
+
+```
+
+```{r}
+# Calculate the accuracy for SVM kern model
+kern_accuracy <- (kern_table[1,1]+kern_table[2,2]+kern_table[3,3])/sum(kern_table[,1:3])
+print(kern_accuracy)
+
+```
+
+``` {r}
+# Tuning the SVM model (for kernlab)
+
+# Tuning "type"
+# default = 0.7
+# C-svc = 0.7
+# nu-svc = 0.6766667
+# C-bsvc = 0.7
+# spoc-svc = 0.73 --> Best Result ("Crammer, Singer native multi-class")
+# kbb-svc = 0.3633333
+# Not Valid: one-svc, eps-svr, nu-svr, eps-bsvr
+
+# Tuning "kernel"
+# default = 0.73 (using "spoc-svc" type above)
+# rbfdot = 0.73
+# polydot = 0.6366667
+# vanilladot = 0.64
+# tanhdot = 0.4233333
+# laplacedot = 0.67
+# besseldot = 0.3333333
+# anovadot = too slow
+# splinedot = too slow
+# stringdot = invalid
+
+# Tuning "C" (cost constraint)
+# C = 0.01 --> 0.6033333
+# C = 0.1 --> 0.65
+# C = 0.95 --> 0.73
+# C = 1 --> 0.73
+# C = 2 --> 0.71
+# C = 5 --> 0.69
+# C = 10 --> 0.6833333
+
+```
+
+
+```{r}
+# get the predicted values
+kern_predictions <- predict(svm_kern, newdata=test_data)
+
+# generate submission
+# submission <- data.table(test[,"id"], status_group = kern_predictions)
+#write.csv(submission, file = "submission.csv", row.names = FALSE)
+```
+
+# Submission Log
+FINAL
+Submission 15: ntrees = 500                                           (0.8218)
+                                class.error                           (0.8115)
+    functional                    0.9563223
+    functional needs repair       0.6550845
+    non functional                0.2182790
+__________________________________________________________________                         
+Submission 14: levels cleaned                                         0.8204
+                                class.error                           (0.8115)
+    functional                    0.1049630
+    functional needs repair       0.6550845
+    non functional                0.2182790
+
+__________________________________________________________________     
+Submission 13: sub12 -norm dist                                       0.8176
+                            class.error
+    functional                0.1042500                               (0.8104)
+    functional needs repair   0.6587908
+    non functional            0.2214336
+__________________________________________________________________     
+Submission12: +norm dist,back to 50 trees+Duarte's changes            0.8187
+                            class.error
+    functional                0.1059859                               (0.8106)     
+    functional needs repair   0.6615705
+    non functional            0.2181038
+__________________________________________________________________     
+Submission11: sub10 (500 trees)                                       0.8114
+                            class.error
+    functional               0.09566323                               (0.8179)
+    functional needs repair  0.66133889
+    non functional           0.21363477
+___________________________________________________________________     
+Submission10: sub7 + fixed lat/long/normal_distance (100 trees)       0.8185
+                            class.error
+    functional                0.1010261                               (0.8135)      
+    functional needs repair   0.6657401
+    non functional            0.2166579
+___________________________________________________________________     
+Submission 9: sub8 + test8.1                                          0.8114
+                            class.error
+    functional                0.1013671                               (0.8035)      
+    functional needs repair   0.6898309
+    non functional            0.2377322
+___________________________________________________________________     
+test8.1: remove gps_height
+                            class.error
+    functional                0.1013671             (0.8035)              
+    functional needs repair   0.6898309
+    non functional            0.2377322
+___________________________________________________________________     
+-OUCH-
+Submission8: sub7 + test7.1
+                            class.error                               0.8125
+    functional                0.1036610                               (0.8034)
+    functional needs repair   0.6956220
+    non functional            0.2335261
+___________________________________________________________________     
+test7.1: abhy's changes (test6.1, remove latitude/longitude)
+                            class.error
+    functional                0.1036610             (0.8034)
+    functional needs repair   0.6956220
+    non functional            0.2335261
+___________________________________________________________________     
+-THESE ARE IMPORTANT CHANGES EVEN THOUGH THE SCORE IS NOT SO NICE
+Submission7: sub4 + test6.1                                           0.8181
+                            class.error
+    functional                0.1045600                               (0.8101)
+    functional needs repair   0.6601807
+    non functional            0.2214336
+___________________________________________________________________     
+test 6.1: abhy's changes (no normal distance, district_code, region_code)
+                            class.error
+    functional                0.1045600                 (0.8101)
+    functional needs repair   0.6601807
+    non functional            0.2214336
+___________________________________________________________________     
+-WORSE-
+Submission6: sub4 + test5.1
+___________________________________________________________________     
+test 5.1: abhy's changes edit1 (impute normal distance outliers, district_code as factor, remove region_code)
+                            class.error
+    functional                0.1037230                 (0.8114)
+    functional needs repair   0.6574010
+    non functional            0.2198125
+___________________________________________________________________     
+-WORSE-
+submission5: sub4 + test4.1                                             0.8173
+                            class.error
+    functional                0.1028860                                 (0.8111)
+    functional needs repair   0.6648135
+    non functional            0.2203821
+___________________________________________________________________     
+test 4.1: abhy's changes (normal distance and district code imputation)
+                            class.error
+    functional                0.1028860                 (0.8111)
+    functional needs repair   0.6648135
+    non functional            0.2203821
+____________________________________________________________________     
+submission4: sub3 + test 3.1                                            0.8203
+                            class.error
+    functional                0.1042810                                 (0.8103)
+    functional needs repair   0.6574010
+    non functional            0.2219155
+____________________________________________________________________     
+test 3.1: conrad's changes
+                            class.error
+    functional                0.1042810                 (0.8103)
+    functional needs repair   0.6574010
+    non functional            0.2219155
+____________________________________________________________________     
+submission3: sub2 + test 2.1                                            0.8172
+                            class.error
+    functional                0.1008091                                 (0.8104)
+    functional needs repair   0.6757007
+    non functional            0.2231861
+____________________________________________________________________     
+test 2.8: 2.4 + remove year_asDate
+                            class.error
+    functional                0.1052729                 (0.8095)
+    functional needs repair   0.6685198
+    non functional            0.2206449
+____________________________________________________________________     
+test 2.7: 2.4 + remove quarter_asDate
+                            class.error
+    functional                0.1042190                 (0.8092)
+    functional needs repair   0.6701413
+    non functional            0.2224851
+____________________________________________________________________     
+test 2.6: 2.4 + remove month_asDate
+                            class.error
+    functional                0.1017081                 (all worse)
+    functional needs repair   0.6761640
+    non functional            0.2241062
+____________________________________________________________________     
+test 2.5: "" + remove week_asDate
+                            class.error
+    functional                0.1007471                 (0.8086)
+    functional needs repair   0.6787121
+    non functional            0.2273046
+____________________________________________________________________     
+test 2.4: age_construct2013 + remove date_recorded (realized this was filtered out)
+                            class.error
+    functional                0.1008091                 (0.8104)
+    functional needs repair   0.6757007
+    non functional            0.2231861
+____________________________________________________________________     
+test 2.3: replace age_construct2013 with age_recorded
+                            class.error
+    functional                0.1011191                 (0.8099)
+    functional needs repair   0.6703729
+    non functional            0.2249825
+____________________________________________________________________     
+test 2.2: "", created age_recorded
+                            class.error                 (0.8091)
+    functional                0.1039400
+    functional needs repair   0.6717628
+    non functional            0.2228356
+____________________________________________________________________     
+test 2.1: imputed construction_year zeros and converted to age_construct2013 (also all the dates)
+                            class.error
+    functional                0.1008091                 (0.8104)
+    functional needs repair   0.6757007
+    non functional            0.2231861
+____________________________________________________________________     
+submission2: sub1 + test1.1-1.4                                        0.8162
+                            class.error
+    functional               0.09789516                                (0.8093)
+    functional needs repair  0.68311327
+    non functional           0.22875044
+_____________________________________________________________________     
+test1.4: "", imputed population zeros (based on region and type)
+                            class.error
+    functional               0.09789516                   (0.8093)
+    functional needs repair  0.68311327
+    non functional           0.22875044
+_____________________________________________________________________     
+test1.3: "", deleted num_private (couldn't find anything important)
+                            class.error
+    functional                0.1012741                   (0.8082)
+    functional needs repair   0.6895993
+    non functional            0.2256835
+___________________________________________________________________     
+test1.2: "", deleted payment (same as payment type)
+                            class.error
+    functional                0.0999101                   (0.8074)
+    functional needs repair   0.6826500
+    non functional            0.2309849
+_____________________________________________________________________     
+test1.1: "", imputed permit/public_meeting based on location 
+                            class.error
+    functional                0.1006541                   (0.8500)?
+    functional needs repair   0.6905258
+    non functional            0.2290571
+_____________________________________________________________________     
+submission1: only NA's, dropped factors with 50+ levels, ntree = 50    0.8153
+                            class.error
+    functional               0.09752317                                (0.8077)
+    functional needs repair  0.68820940
+    non functional           0.23238696
